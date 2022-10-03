@@ -278,16 +278,18 @@ func (rs *RapidSyncer) getAvailableFiles(ctx context.Context, repo string) (map[
 			filesSet[file] = struct{}{}
 		}
 	}
+	cancel() // To remove warning
 	return filesSet, firstError
 }
 
 // Computes difference between the source and destination repos.
 // Returns:
-//   bool - are the same (even when missing archives can be empty,
-//          tags can point at different hashes)
-//   []string - list of hashes of missing sdp archives
-//   []byte - source versions
-//   error - if there was any error during computation
+//
+//	bool - are the same (even when missing archives can be empty,
+//	       tags can point at different hashes)
+//	[]string - list of hashes of missing sdp archives
+//	[]byte - source versions
+//	error - if there was any error during computation
 func (rs *RapidSyncer) compareVersions(ctx context.Context, srcRepo string, dstRepo string) (bool, []string, []byte, error) {
 	var srcArchives, destArchives []archive
 	var srcVersions []byte
@@ -476,9 +478,7 @@ func (rs *RapidSyncer) syncMissingArchives(ctx context.Context, srcRepo string, 
 	}()
 
 	err := <-errorCh
-	if err != nil {
-		cancel()
-	}
+	cancel()
 	return err
 }
 
