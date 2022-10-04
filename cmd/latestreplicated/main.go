@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,88 +21,23 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
-	"github.com/golang/geo/s1"
-	"github.com/golang/geo/s2"
-	"golang.org/x/sync/singleflight"
+	"github.com/p2004a/spring-rapid-syncer/pkg/bunny"
+	"github.com/p2004a/spring-rapid-syncer/pkg/sfcache"
+	"golang.org/x/sync/errgroup"
 )
 
-var (
-	bunnyServerRE        = regexp.MustCompile(`^BunnyCDN-([A-Z]+\d*)-(\d+)$`)
-	bunnyStorageServerRE = regexp.MustCompile(`^([A-Z]+)-(\d+)$`)
-)
+const UserAgent = "spring-rapid-syncer/latestreplicated 1.0"
 
 type Server struct {
-	client                 http.Client
+	http                   http.Client
+	bunny                  *bunny.Client
 	versionsGzUrl          string
 	maxRegionDistanceKm    float64
 	expectedStorageServers []string
-	serversMap             ServersMap
-	serversMapMu           sync.RWMutex
-	serversMapLastUpdate   time.Time
 	gcsCacheBucket         string
 	gcsClient              *storage.Client
-	serversMapRefreshSFG   singleflight.Group
-	triedFromGCS           bool
-	versionsGzSFG          singleflight.Group
-}
-
-func (s *Server) getBunnyEdgeServers(ctx context.Context) ([]string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.bunny.net/system/edgeserverlist", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "spring-rapid-syncer/latestreplicated 1.0")
-	req.Header.Set("Accept", "application/json")
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("http request failed with code: %d", resp.StatusCode)
-	}
-	var servers []string
-	decoder := json.NewDecoder(resp.Body)
-	err = decoder.Decode(&servers)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode json for edgeserverlist: %v", err)
-	}
-	return servers, nil
-}
-
-type BunnyRegion struct {
-	Id               int
-	Name             string
-	PricePerGigabyte float64
-	RegionCode       string
-	ContinentCode    string
-	CountryCode      string
-	Latitude         float64
-	Longitude        float64
-}
-
-func (s *Server) getBunnyRegions(ctx context.Context) ([]BunnyRegion, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.bunny.net/region", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "spring-rapid-syncer/latestreplicated 1.0")
-	req.Header.Set("Accept", "application/json")
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("http request failed with code: %d", resp.StatusCode)
-	}
-	var regions []BunnyRegion
-	decoder := json.NewDecoder(resp.Body)
-	err = decoder.Decode(&regions)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode json for edgeserverlist: %v", err)
-	}
-	return regions, nil
+	serversMapCache        sfcache.Cache[ServersMap]
+	versionsGzCache        sfcache.Cache[[]*versionsGzFile]
 }
 
 func httpClientForAddr(addr string, timeout time.Duration) http.Client {
@@ -130,7 +64,7 @@ func resolveBunnyEdgeServer(ctx context.Context, ip, markerUrl string) BunnyEdge
 	if err != nil {
 		return BunnyEdgeServer{IP: ip, Error: err}
 	}
-	req.Header.Set("User-Agent", "spring-rapid-syncer/latestreplicated 1.0")
+	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("Cache-Control", "no-cache")
 	resp, err := client.Do(req)
 	if err != nil {
@@ -140,18 +74,18 @@ func resolveBunnyEdgeServer(ctx context.Context, ip, markerUrl string) BunnyEdge
 	if resp.Header.Get("CDN-Cache") != "BYPASS" {
 		return BunnyEdgeServer{IP: ip, Error: fmt.Errorf("cache must be bypasssed, got %s", resp.Header.Get("CDN-Cache"))}
 	}
-	serverMatch := bunnyServerRE.FindStringSubmatch(resp.Header.Get("Server"))
-	if serverMatch == nil {
-		return BunnyEdgeServer{IP: ip, Error: fmt.Errorf("failed to parse server name, got %s", resp.Header.Get("Server"))}
+	serverRegion, err := bunny.ServerRegionCode(&resp.Header)
+	if err != nil {
+		return BunnyEdgeServer{IP: ip, Error: err}
 	}
-	storageServerMatch := bunnyStorageServerRE.FindStringSubmatch(resp.Header.Get("CDN-StorageServer"))
-	if storageServerMatch == nil {
-		return BunnyEdgeServer{IP: ip, Error: fmt.Errorf("failed to parse server name, got %s", resp.Header.Get("CDN-StorageServer"))}
+	storageServerRegion, err := bunny.StorageServerRegionCode(&resp.Header)
+	if err != nil {
+		return BunnyEdgeServer{IP: ip, Error: err}
 	}
 	return BunnyEdgeServer{
 		IP:                  ip,
-		ServerRegion:        serverMatch[1],
-		StorageServerRegion: storageServerMatch[1],
+		ServerRegion:        serverRegion,
+		StorageServerRegion: storageServerRegion,
 		Error:               nil,
 	}
 }
@@ -170,30 +104,19 @@ func resolveBunnyEdgeServers(ctx context.Context, servers []string, markerUrl st
 	return edgeServers
 }
 
-func angleToKm(angle s1.Angle) float64 {
-	earthRadiusKm := 6371.0
-	return angle.Radians() * earthRadiusKm
-}
-
-func regionsDistanceKm(a, b *BunnyRegion) float64 {
-	aLL := s2.LatLngFromDegrees(a.Latitude, a.Longitude)
-	bAll := s2.LatLngFromDegrees(b.Latitude, b.Longitude)
-	return angleToKm(aLL.Distance(bAll))
-}
-
 type ServersMap map[string][]string
 
 func (s *Server) buildEdgeServersMap(ctx context.Context) (ServersMap, error) {
-	regions, err := s.getBunnyRegions(ctx)
+	regions, err := s.bunny.Regions(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get bunny regions: %v", err)
 	}
-	regByCode := make(map[string]*BunnyRegion)
+	regByCode := make(map[string]*bunny.Region)
 	for i, reg := range regions {
 		regByCode[reg.RegionCode] = &regions[i]
 	}
 
-	serverIPs, err := s.getBunnyEdgeServers(ctx)
+	serverIPs, err := s.bunny.EdgeServersIP(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch edge servers: %v", err)
 	}
@@ -206,14 +129,14 @@ func (s *Server) buildEdgeServersMap(ctx context.Context) (ServersMap, error) {
 		}
 		edgeReg, ok := regByCode[serv.ServerRegion]
 		if !ok {
-			log.Printf("WARN: Failed to find region for edge region %s", serv.ServerRegion)
+			log.Printf("WARN: Failed to find bunny region for edge region code %s", serv.ServerRegion)
 			continue
 		}
 		storageReg, ok := regByCode[serv.StorageServerRegion]
 		if !ok {
 			return nil, fmt.Errorf("failed to find region for storage region %s", serv.StorageServerRegion)
 		}
-		if regionsDistanceKm(edgeReg, storageReg) <= s.maxRegionDistanceKm {
+		if bunny.RegionsDistanceKm(edgeReg, storageReg) <= s.maxRegionDistanceKm {
 			sm[serv.StorageServerRegion] = append(sm[serv.StorageServerRegion], serv.IP)
 		}
 	}
@@ -230,101 +153,75 @@ func (s *Server) buildEdgeServersMap(ctx context.Context) (ServersMap, error) {
 	return sm, nil
 }
 
-func (s *Server) loadCachedServersMap(ctx context.Context) ServersMap {
-	s.serversMapMu.RLock()
-	serversMap := s.serversMap
-	serversMapLastUpdate := s.serversMapLastUpdate
-	triedFromGCS := s.triedFromGCS
-	s.serversMapMu.RUnlock()
+func (s *Server) fetchEdgeServersMapFromGCS(ctx context.Context) (ServersMap, error) {
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
 
-	if serversMap != nil && serversMapLastUpdate.After(time.Now().Add(-24*time.Hour)) {
-		return serversMap
-	} else if serversMap == nil && s.gcsClient != nil && !triedFromGCS {
-		s.serversMapMu.Lock()
-		defer s.serversMapMu.Unlock()
-
-		subCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-		defer cancel()
-
-		// In case we were fighting for lock
-		if s.serversMap != nil || s.triedFromGCS {
-			return s.serversMap
-		}
-
-		obj := s.gcsClient.Bucket(s.gcsCacheBucket).Object("serversMap.json")
-		attrs, err := obj.Attrs(subCtx)
-		if err != nil && err != storage.ErrObjectNotExist {
-			log.Printf("WARN: getting serversMap.json attrs failed: %v", err)
-			return nil
-		}
-		if err == storage.ErrObjectNotExist || attrs.Updated.Before(time.Now().Add(-24*time.Hour)) {
-			s.triedFromGCS = true
-			return nil
-		}
-		r, err := obj.NewReader(subCtx)
-		if err != nil {
-			log.Printf("WARN: creating serversMap.json reader: %v", err)
-			return nil
-		}
-		sm := make(ServersMap)
-		decoder := json.NewDecoder(r)
-		err = decoder.Decode(&sm)
-		if err != nil {
-			log.Printf("WARN: failed to decode json for servers map: %v", err)
-			return nil
-		}
-		log.Printf("INFO: loaded serversMap.json from GCS")
-		s.serversMap = sm
-		s.serversMapLastUpdate = attrs.Updated
-		return sm
+	obj := s.gcsClient.Bucket(s.gcsCacheBucket).Object("serversMap.json")
+	attrs, err := obj.Attrs(ctx)
+	if err != nil && err != storage.ErrObjectNotExist {
+		return nil, fmt.Errorf("getting serversMap.json attrs failed: %v", err)
 	}
+	if err == storage.ErrObjectNotExist || attrs.Updated.Before(time.Now().Add(-24*time.Hour)) {
+		return nil, nil
+	}
+	r, err := obj.NewReader(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("creating serversMap.json reader: %v", err)
+	}
+	sm := make(ServersMap)
+	decoder := json.NewDecoder(r)
+	if err := decoder.Decode(&sm); err != nil {
+		return nil, fmt.Errorf("failed to decode json for servers map: %v", err)
+	}
+	return sm, nil
+}
 
+func (s *Server) saveEdgeServersMapToGCS(ctx context.Context, sm ServersMap) error {
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+	obj := s.gcsClient.Bucket(s.gcsCacheBucket).Object("serversMap.json")
+	w := obj.NewWriter(ctx)
+	enc := json.NewEncoder(w)
+	if err := enc.Encode(sm); err != nil {
+		return fmt.Errorf("failed to encode serversMap: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("failed to write serversMap to GCS: %v", err)
+	}
 	return nil
 }
 
-func (s *Server) cacheServersMap(ctx context.Context, sm ServersMap) {
-	if s.gcsCacheBucket != "" {
-		obj := s.gcsClient.Bucket(s.gcsCacheBucket).Object("serversMap.json")
-		w := obj.NewWriter(ctx)
-		enc := json.NewEncoder(w)
-		if err := enc.Encode(sm); err != nil {
-			log.Printf("WARN: failed to encode serversMap: %v", err)
-		}
-		if err := w.Close(); err != nil {
-			log.Printf("WARN: failed to write serversMap to GCS: %v", err)
-		} else {
-			log.Printf("INFO: cached serversMap.json in GCS")
+func (s *Server) fetchEdgeServersMap(ctx context.Context) (ServersMap, error) {
+	if s.gcsClient != nil {
+		sm, err := s.fetchEdgeServersMapFromGCS(ctx)
+		if err != nil {
+			log.Printf("WARN: fetching from GCS failed: %v", err)
+		} else if sm != nil {
+			log.Printf("INFO: loaded serversMap.json from GCS")
+			return sm, nil
 		}
 	}
-
-	s.serversMapMu.Lock()
-	defer s.serversMapMu.Unlock()
-	s.serversMap = sm
-	s.serversMapLastUpdate = time.Now()
+	sm, err := s.buildEdgeServersMap(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("build edge server map: %v", err)
+	}
+	if s.gcsClient != nil {
+		if err := s.saveEdgeServersMapToGCS(ctx, sm); err != nil {
+			log.Printf("WARN: failed to save to GCS: %v", err)
+		} else {
+			log.Printf("INFO: saved serversMap.json to GCS")
+		}
+	}
+	return sm, nil
 }
 
-func (s *Server) getEdgeServersMap(ctx context.Context) (ServersMap, error) {
-	if sm := s.loadCachedServersMap(ctx); sm != nil {
-		return sm, nil
-	}
-	resCh := s.serversMapRefreshSFG.DoChan("", func() (interface{}, error) {
+func (s *Server) sfFetchEdgeServersMap(ctx context.Context) (ServersMap, error) {
+	return s.serversMapCache.Get(ctx, func() (ServersMap, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-
-		sm, err := s.buildEdgeServersMap(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to refresh serversMap: %v", err)
-		}
-		s.cacheServersMap(ctx, sm)
-		return sm, err
+		return s.fetchEdgeServersMap(ctx)
 	})
-
-	select {
-	case res := <-resCh:
-		return res.Val.(ServersMap), res.Err
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
 }
 
 type versionsGzFile struct {
@@ -333,6 +230,18 @@ type versionsGzFile struct {
 	etag          string
 	storageServer string
 }
+
+type byServerName []*versionsGzFile
+
+func (s byServerName) Len() int           { return len(s) }
+func (s byServerName) Less(i, j int) bool { return s[i].storageServer < s[i].storageServer }
+func (s byServerName) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+
+type byLastModified []*versionsGzFile
+
+func (s byLastModified) Len() int           { return len(s) }
+func (s byLastModified) Less(i, j int) bool { return s[i].lastModified.Before(s[j].lastModified) }
+func (s byLastModified) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 func (s *Server) fetchVersionsGZ(ctx context.Context, ip, expectedSS string) (*versionsGzFile, error) {
 	client := httpClientForAddr(ip+":443", time.Second*20)
@@ -355,12 +264,12 @@ func (s *Server) fetchVersionsGZ(ctx context.Context, ip, expectedSS string) (*v
 		return nil, fmt.Errorf("downloading versions.gz failed: %v", err)
 	}
 
-	storageServerMatch := bunnyStorageServerRE.FindStringSubmatch(resp.Header.Get("CDN-StorageServer"))
-	if storageServerMatch == nil {
-		return nil, fmt.Errorf("failed to parse server name, got %s", resp.Header.Get("CDN-StorageServer"))
+	storageServerRegion, err := bunny.StorageServerRegionCode(&resp.Header)
+	if err != nil {
+		return nil, err
 	}
-	if storageServerMatch[1] != expectedSS {
-		return nil, fmt.Errorf("got response from unexpected storage server from edge %s: %s, expected %s", ip, storageServerMatch[1], expectedSS)
+	if storageServerRegion != expectedSS {
+		return nil, fmt.Errorf("got response from unexpected storage server from edge %s: %s, expected %s", ip, storageServerRegion, expectedSS)
 	}
 
 	modified, err := http.ParseTime(resp.Header.Get("Last-Modified"))
@@ -376,53 +285,34 @@ func (s *Server) fetchVersionsGZ(ctx context.Context, ip, expectedSS string) (*v
 	}, nil
 }
 
-func (s *Server) fetchLatestSyncedVersionsGZ(ctx context.Context, sm ServersMap) (*versionsGzFile, []*versionsGzFile, error) {
-	subCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	errorCh := make(chan error, len(sm))
-	versionsGzCh := make(chan *versionsGzFile, len(sm))
-	for ss, ips := range sm {
+func (s *Server) fetchLatestSyncedVersionsGZ(ctx context.Context, sm ServersMap) ([]*versionsGzFile, error) {
+	grp, subCtx := errgroup.WithContext(ctx)
+	allVersionsGz := make([]*versionsGzFile, len(sm))
+	i := 0
+	for storageServer, ips := range sm {
 		ip := ips[rand.Intn(len(ips))]
-		go func(ss string, ip string) {
-			ver, err := s.fetchVersionsGZ(subCtx, ip, ss)
-			if err != nil {
-				errorCh <- err
-			} else {
-				versionsGzCh <- ver
-			}
-		}(ss, ip)
+		id := i
+		ss := storageServer
+		grp.Go(func() error {
+			var err error
+			allVersionsGz[id], err = s.fetchVersionsGZ(subCtx, ip, ss)
+			return err
+		})
+		i++
 	}
-	var allVersionsGz []*versionsGzFile
-	minVersionsGzFile := &versionsGzFile{lastModified: time.Now()}
-	for i := 0; i < len(sm); i++ {
-		select {
-		case err := <-errorCh:
-			return nil, nil, err
-		case ver := <-versionsGzCh:
-			allVersionsGz = append(allVersionsGz, ver)
-			if ver.lastModified.Before(minVersionsGzFile.lastModified) {
-				minVersionsGzFile = ver
-			}
-		}
+	if err := grp.Wait(); err != nil {
+		return nil, err
 	}
-	return minVersionsGzFile, allVersionsGz, nil
+	sort.Sort(byLastModified(allVersionsGz))
+	return allVersionsGz, nil
 }
 
-func (s *Server) sfFetchLatestSyncedVersionsGZ(ctx context.Context, sm ServersMap) (*versionsGzFile, []*versionsGzFile, error) {
-	type Res struct {
-		minV *versionsGzFile
-		allV []*versionsGzFile
-	}
-	resCh := s.versionsGzSFG.DoChan("", func() (interface{}, error) {
-		minV, allV, err := s.fetchLatestSyncedVersionsGZ(context.Background(), sm)
-		return Res{minV, allV}, err
+func (s *Server) sfFetchLatestSyncedVersionsGZ(ctx context.Context, sm ServersMap) ([]*versionsGzFile, error) {
+	return s.versionsGzCache.Get(ctx, func() ([]*versionsGzFile, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		return s.fetchLatestSyncedVersionsGZ(ctx, sm)
 	})
-	select {
-	case res := <-resCh:
-		return res.Val.(Res).minV, res.Val.(Res).allV, res.Err
-	case <-ctx.Done():
-		return nil, nil, ctx.Err()
-	}
 }
 
 func (s *Server) HandleServerMap(w http.ResponseWriter, r *http.Request) {
@@ -431,7 +321,7 @@ func (s *Server) HandleServerMap(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	serversMap, err := s.getEdgeServersMap(r.Context())
+	serversMap, err := s.sfFetchEdgeServersMap(r.Context())
 	if err != nil {
 		log.Printf("Failed to get edge server map: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -454,14 +344,14 @@ func (s *Server) HandleVersionsGz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	serversMap, err := s.getEdgeServersMap(r.Context())
+	serversMap, err := s.sfFetchEdgeServersMap(r.Context())
 	if err != nil {
 		log.Printf("Failed to get edge server map: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	versionsGz, _, err := s.sfFetchLatestSyncedVersionsGZ(r.Context(), serversMap)
+	versionsGz, err := s.sfFetchLatestSyncedVersionsGZ(r.Context(), serversMap)
 	if err != nil {
 		log.Printf("Failed to fetch lastes versionsGz: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -469,20 +359,14 @@ func (s *Server) HandleVersionsGz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Last-Modified", versionsGz.lastModified.Format(http.TimeFormat))
-	w.Header().Set("ETag", versionsGz.etag)
-	w.Header().Set("LastReplicated-StorageServer", versionsGz.storageServer)
+	w.Header().Set("Last-Modified", versionsGz[0].lastModified.Format(http.TimeFormat))
+	w.Header().Set("ETag", versionsGz[0].etag)
+	w.Header().Set("LatestReplicated-StorageServer", versionsGz[0].storageServer)
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {
-		w.Write(versionsGz.contents)
+		w.Write(versionsGz[0].contents)
 	}
 }
-
-type byServerName []*versionsGzFile
-
-func (s byServerName) Len() int           { return len(s) }
-func (s byServerName) Less(i, j int) bool { return s[i].storageServer < s[i].storageServer }
-func (s byServerName) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 func (s *Server) HandleLatestReplicated(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -491,14 +375,14 @@ func (s *Server) HandleLatestReplicated(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	serversMap, err := s.getEdgeServersMap(r.Context())
+	serversMap, err := s.sfFetchEdgeServersMap(r.Context())
 	if err != nil {
 		log.Printf("Failed to get edge server map: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	_, allVersionsGz, err := s.sfFetchLatestSyncedVersionsGZ(r.Context(), serversMap)
+	versionsGz, err := s.sfFetchLatestSyncedVersionsGZ(r.Context(), serversMap)
 	if err != nil {
 		log.Printf("Failed to fetch lastes versionsGz: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -506,8 +390,8 @@ func (s *Server) HandleLatestReplicated(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var out strings.Builder
-	sort.Sort(byServerName(allVersionsGz))
-	for _, ver := range allVersionsGz {
+	sort.Sort(byServerName(versionsGz))
+	for _, ver := range versionsGz {
 		out.WriteString(fmt.Sprintf("%s: %s (etag: %s)", ver.storageServer, ver.lastModified.Format(http.TimeFormat), ver.etag))
 		out.WriteString("\n")
 	}
@@ -547,14 +431,21 @@ func main() {
 	}
 
 	server := &Server{
-		client: http.Client{
+		http: http.Client{
 			Timeout: time.Second * 5,
 		},
+		bunny:                  bunny.NewClient(""),
 		versionsGzUrl:          versionsGzUrl,
 		maxRegionDistanceKm:    maxRegionDistancFloat,
 		expectedStorageServers: strings.Split(expectedStorageRegions, ","),
 		gcsCacheBucket:         gcsCacheBucket,
 		gcsClient:              gcsClient,
+		serversMapCache: sfcache.Cache[ServersMap]{
+			Timeout: 4 * time.Hour,
+		},
+		versionsGzCache: sfcache.Cache[[]*versionsGzFile]{
+			Timeout: 10 * time.Second,
+		},
 	}
 
 	http.HandleFunc("/servermap", server.HandleServerMap)
