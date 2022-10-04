@@ -36,6 +36,7 @@ type Server struct {
 	expectedStorageServers []string
 	gcsCacheBucket         string
 	gcsClient              *storage.Client
+	serverMapCacheDuration time.Duration
 	serversMapCache        sfcache.Cache[ServersMap]
 	versionsGzCache        sfcache.Cache[[]*versionsGzFile]
 }
@@ -162,7 +163,7 @@ func (s *Server) fetchEdgeServersMapFromGCS(ctx context.Context) (ServersMap, er
 	if err != nil && err != storage.ErrObjectNotExist {
 		return nil, fmt.Errorf("getting serversMap.json attrs failed: %v", err)
 	}
-	if err == storage.ErrObjectNotExist || attrs.Updated.Before(time.Now().Add(-24*time.Hour)) {
+	if err == storage.ErrObjectNotExist || attrs.Updated.Before(time.Now().Add(-s.serverMapCacheDuration)) {
 		return nil, nil
 	}
 	r, err := obj.NewReader(ctx)
@@ -420,6 +421,25 @@ func main() {
 		log.Fatalf("Failed to parse MAX_REGION_DISTANCE_KM env as float: %v", err)
 	}
 
+	versionsGzCacheDurationStr := os.Getenv("VERSION_GZ_CACHE_DURATION")
+	if versionsGzCacheDurationStr == "" {
+		versionsGzCacheDurationStr = "10s"
+	}
+	versionsGzCacheDuration, err := time.ParseDuration(versionsGzCacheDurationStr)
+	if err != nil {
+		log.Fatalf("Failed to parse VERSION_GZ_CACHE_DURATION: %v", err)
+	}
+
+	serverMapCacheDurationStr := os.Getenv("SERVER_MAP_CACHE_DURATION")
+	if serverMapCacheDurationStr == "" {
+		serverMapCacheDurationStr = "24h"
+	}
+	serverMapCacheDuration, err := time.ParseDuration(serverMapCacheDurationStr)
+	if err != nil {
+		log.Fatalf("Failed to parse SERVER_MAP_CACHE_DURATION: %v", err)
+	}
+	serverMapCacheDurationLocal := serverMapCacheDuration
+
 	gcsCacheBucket := os.Getenv("GCS_CACHE_BUCKET")
 	ctx := context.Background()
 	var gcsClient *storage.Client
@@ -428,6 +448,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to create GCS client: %v", err)
 		}
+		serverMapCacheDurationLocal /= 4
 	}
 
 	server := &Server{
@@ -440,11 +461,12 @@ func main() {
 		expectedStorageServers: strings.Split(expectedStorageRegions, ","),
 		gcsCacheBucket:         gcsCacheBucket,
 		gcsClient:              gcsClient,
+		serverMapCacheDuration: serverMapCacheDuration,
 		serversMapCache: sfcache.Cache[ServersMap]{
-			Timeout: 4 * time.Hour,
+			Timeout: serverMapCacheDurationLocal,
 		},
 		versionsGzCache: sfcache.Cache[[]*versionsGzFile]{
-			Timeout: 10 * time.Second,
+			Timeout: versionsGzCacheDuration,
 		},
 	}
 
