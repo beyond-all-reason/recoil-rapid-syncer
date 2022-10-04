@@ -34,10 +34,12 @@ func (c *Cache[T]) Get(ctx context.Context, updater func() (T, error)) (T, error
 
 	resCh := c.sfg.DoChan("", func() (interface{}, error) {
 		val, err := updater()
-		c.mu.Lock()
-		c.value = val
-		c.lastUpdate = time.Now()
-		c.mu.Unlock()
+		if err == nil {
+			c.mu.Lock()
+			c.value = val
+			c.lastUpdate = time.Now()
+			c.mu.Unlock()
+		}
 		return val, err
 	})
 
