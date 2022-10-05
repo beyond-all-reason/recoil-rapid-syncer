@@ -110,7 +110,7 @@ type ServersMap map[string][]string
 func (s *Server) buildEdgeServersMap(ctx context.Context) (ServersMap, error) {
 	regions, err := s.bunny.Regions(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get bunny regions: %v", err)
+		return nil, fmt.Errorf("failed to get bunny regions: %w", err)
 	}
 	regByCode := make(map[string]*bunny.Region)
 	for i, reg := range regions {
@@ -119,7 +119,7 @@ func (s *Server) buildEdgeServersMap(ctx context.Context) (ServersMap, error) {
 
 	serverIPs, err := s.bunny.EdgeServersIP(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch edge servers: %v", err)
+		return nil, fmt.Errorf("failed to fetch edge servers: %w", err)
 	}
 	servers := resolveBunnyEdgeServers(ctx, serverIPs, s.versionsGzUrl)
 
@@ -161,19 +161,19 @@ func (s *Server) fetchEdgeServersMapFromGCS(ctx context.Context) (ServersMap, er
 	obj := s.gcsClient.Bucket(s.gcsCacheBucket).Object("serversMap.json")
 	attrs, err := obj.Attrs(ctx)
 	if err != nil && err != storage.ErrObjectNotExist {
-		return nil, fmt.Errorf("getting serversMap.json attrs failed: %v", err)
+		return nil, fmt.Errorf("getting serversMap.json attrs failed: %w", err)
 	}
 	if err == storage.ErrObjectNotExist || attrs.Updated.Before(time.Now().Add(-s.serverMapCacheDuration)) {
 		return nil, nil
 	}
 	r, err := obj.NewReader(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("creating serversMap.json reader: %v", err)
+		return nil, fmt.Errorf("creating serversMap.json reader: %w", err)
 	}
 	sm := make(ServersMap)
 	decoder := json.NewDecoder(r)
 	if err := decoder.Decode(&sm); err != nil {
-		return nil, fmt.Errorf("failed to decode json for servers map: %v", err)
+		return nil, fmt.Errorf("failed to decode json for servers map: %w", err)
 	}
 	return sm, nil
 }
@@ -185,10 +185,10 @@ func (s *Server) saveEdgeServersMapToGCS(ctx context.Context, sm ServersMap) err
 	w := obj.NewWriter(ctx)
 	enc := json.NewEncoder(w)
 	if err := enc.Encode(sm); err != nil {
-		return fmt.Errorf("failed to encode serversMap: %v", err)
+		return fmt.Errorf("failed to encode serversMap: %w", err)
 	}
 	if err := w.Close(); err != nil {
-		return fmt.Errorf("failed to write serversMap to GCS: %v", err)
+		return fmt.Errorf("failed to write serversMap to GCS: %w", err)
 	}
 	return nil
 }
@@ -205,7 +205,7 @@ func (s *Server) fetchEdgeServersMap(ctx context.Context) (ServersMap, error) {
 	}
 	sm, err := s.buildEdgeServersMap(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("build edge server map: %v", err)
+		return nil, fmt.Errorf("build edge server map: %w", err)
 	}
 	if s.gcsClient != nil {
 		if err := s.saveEdgeServersMapToGCS(ctx, sm); err != nil {
@@ -254,7 +254,7 @@ func (s *Server) fetchVersionsGZ(ctx context.Context, ip, expectedSS string) (*v
 	req.Header.Set("Cache-Control", "no-cache")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request to ip %s failed with: %v", ip, err)
+		return nil, fmt.Errorf("request to ip %s failed with: %w", ip, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -262,7 +262,7 @@ func (s *Server) fetchVersionsGZ(ctx context.Context, ip, expectedSS string) (*v
 	}
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("downloading versions.gz failed: %v", err)
+		return nil, fmt.Errorf("downloading versions.gz failed: %w", err)
 	}
 
 	storageServerRegion, err := bunny.StorageServerRegionCode(&resp.Header)
@@ -275,7 +275,7 @@ func (s *Server) fetchVersionsGZ(ctx context.Context, ip, expectedSS string) (*v
 
 	modified, err := http.ParseTime(resp.Header.Get("Last-Modified"))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse Last-Modified: %v", err)
+		return nil, fmt.Errorf("failed to parse Last-Modified: %w", err)
 	}
 
 	return &versionsGzFile{
@@ -354,7 +354,7 @@ func (s *Server) HandleVersionsGz(w http.ResponseWriter, r *http.Request) {
 
 	versionsGz, err := s.sfFetchLatestSyncedVersionsGZ(r.Context(), serversMap)
 	if err != nil {
-		log.Printf("Failed to fetch lastes versionsGz: %v", err)
+		log.Printf("Failed to fetch latest versionsGz: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}

@@ -62,7 +62,7 @@ func (c *Client) EdgeServersIP(ctx context.Context) ([]string, error) {
 	decoder := json.NewDecoder(resp.Body)
 	err = decoder.Decode(&servers)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode json for edgeserverlist: %v", err)
+		return nil, fmt.Errorf("failed to decode json for edgeserverlist: %w", err)
 	}
 	return servers, nil
 }
@@ -97,7 +97,7 @@ func (c *Client) Regions(ctx context.Context) ([]Region, error) {
 	decoder := json.NewDecoder(resp.Body)
 	err = decoder.Decode(&regions)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode json for edgeserverlist: %v", err)
+		return nil, fmt.Errorf("failed to decode json for edgeserverlist: %w", err)
 	}
 	return regions, nil
 }
