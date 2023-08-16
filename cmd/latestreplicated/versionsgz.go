@@ -75,7 +75,7 @@ func (s *Server) fetchVersionsGZ(ctx context.Context, ip, expectedSS string) (*v
 	}, nil
 }
 
-func (s *Server) fetchLatestSyncedVersionsGZ(ctx context.Context, sm ServersMap) ([]*versionsGzFile, error) {
+func (s *Server) fetchLatestSyncedVersionsGZ(ctx context.Context, sm StorageEdgeMap) ([]*versionsGzFile, error) {
 	grp, subCtx := errgroup.WithContext(ctx)
 	allVersionsGz := make([]*versionsGzFile, len(sm))
 	i := 0
@@ -97,7 +97,7 @@ func (s *Server) fetchLatestSyncedVersionsGZ(ctx context.Context, sm ServersMap)
 	return allVersionsGz, nil
 }
 
-func (s *Server) sfFetchLatestSyncedVersionsGZ(ctx context.Context, sm ServersMap) ([]*versionsGzFile, error) {
+func (s *Server) sfFetchLatestSyncedVersionsGZ(ctx context.Context, sm StorageEdgeMap) ([]*versionsGzFile, error) {
 	return s.versionsGzCache.Get(ctx, func() ([]*versionsGzFile, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
@@ -112,7 +112,7 @@ func (s *Server) HandleVersionsGz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	serversMap, err := s.sfFetchEdgeServersMap(r.Context())
+	serversMap, err := s.sfFetchStorageEdgeMap(r.Context())
 	if err != nil {
 		log.Printf("Failed to get edge server map: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)

@@ -24,16 +24,16 @@ import (
 const UserAgent = "spring-rapid-syncer/latestreplicated 1.0"
 
 type Server struct {
-	http                   http.Client
-	bunny                  *bunny.Client
-	versionsGzUrl          string
-	maxRegionDistanceKm    float64
-	expectedStorageServers []string
-	gcsCacheBucket         string
-	gcsClient              *storage.Client
-	serverMapCacheDuration time.Duration
-	serversMapCache        sfcache.Cache[ServersMap]
-	versionsGzCache        sfcache.Cache[[]*versionsGzFile]
+	http                        http.Client
+	bunny                       *bunny.Client
+	versionsGzUrl               string
+	maxRegionDistanceKm         float64
+	expectedStorageServers      []string
+	gcsCacheBucket              string
+	gcsClient                   *storage.Client
+	storageEdgeMapCacheDuration time.Duration
+	storageEdgeMapCache         sfcache.Cache[StorageEdgeMap]
+	versionsGzCache             sfcache.Cache[[]*versionsGzFile]
 }
 
 func httpClientForAddr(addr string, timeout time.Duration) http.Client {
@@ -56,9 +56,9 @@ func (s *Server) HandleLatestReplicated(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	serversMap, err := s.sfFetchEdgeServersMap(r.Context())
+	serversMap, err := s.sfFetchStorageEdgeMap(r.Context())
 	if err != nil {
-		log.Printf("Failed to get edge server map: %v", err)
+		log.Printf("Failed to get storage edge server map: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
@@ -110,15 +110,15 @@ func main() {
 		log.Fatalf("Failed to parse VERSION_GZ_CACHE_DURATION: %v", err)
 	}
 
-	serverMapCacheDurationStr := os.Getenv("SERVER_MAP_CACHE_DURATION")
-	if serverMapCacheDurationStr == "" {
-		serverMapCacheDurationStr = "24h"
+	storageEdgeMapCacheDurationStr := os.Getenv("STORAGE_EDGE_MAP_CACHE_DURATION")
+	if storageEdgeMapCacheDurationStr == "" {
+		storageEdgeMapCacheDurationStr = "24h"
 	}
-	serverMapCacheDuration, err := time.ParseDuration(serverMapCacheDurationStr)
+	storageEdgeMapCacheDuration, err := time.ParseDuration(storageEdgeMapCacheDurationStr)
 	if err != nil {
-		log.Fatalf("Failed to parse SERVER_MAP_CACHE_DURATION: %v", err)
+		log.Fatalf("Failed to parse STORAGE_EDGE_MAP_CACHE_DURATION: %v", err)
 	}
-	serverMapCacheDurationLocal := serverMapCacheDuration
+	storageEdgeMapCacheDurationLocal := storageEdgeMapCacheDuration
 
 	gcsCacheBucket := os.Getenv("GCS_CACHE_BUCKET")
 	ctx := context.Background()
@@ -128,29 +128,29 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to create GCS client: %v", err)
 		}
-		serverMapCacheDurationLocal /= 4
+		storageEdgeMapCacheDurationLocal /= 4
 	}
 
 	server := &Server{
 		http: http.Client{
 			Timeout: time.Second * 5,
 		},
-		bunny:                  bunny.NewClient(""),
-		versionsGzUrl:          versionsGzUrl,
-		maxRegionDistanceKm:    maxRegionDistancFloat,
-		expectedStorageServers: strings.Split(expectedStorageRegions, ","),
-		gcsCacheBucket:         gcsCacheBucket,
-		gcsClient:              gcsClient,
-		serverMapCacheDuration: serverMapCacheDuration,
-		serversMapCache: sfcache.Cache[ServersMap]{
-			Timeout: serverMapCacheDurationLocal,
+		bunny:                       bunny.NewClient(""),
+		versionsGzUrl:               versionsGzUrl,
+		maxRegionDistanceKm:         maxRegionDistancFloat,
+		expectedStorageServers:      strings.Split(expectedStorageRegions, ","),
+		gcsCacheBucket:              gcsCacheBucket,
+		gcsClient:                   gcsClient,
+		storageEdgeMapCacheDuration: storageEdgeMapCacheDuration,
+		storageEdgeMapCache: sfcache.Cache[StorageEdgeMap]{
+			Timeout: storageEdgeMapCacheDurationLocal,
 		},
 		versionsGzCache: sfcache.Cache[[]*versionsGzFile]{
 			Timeout: versionsGzCacheDuration,
 		},
 	}
 
-	http.HandleFunc("/servermap", server.HandleServerMap)
+	http.HandleFunc("/storageedgemap", server.HandleStorageEdgeMap)
 	http.HandleFunc("/latestreplicated", server.HandleLatestReplicated)
 	http.HandleFunc("/versions.gz", server.HandleVersionsGz)
 	port := os.Getenv("PORT")

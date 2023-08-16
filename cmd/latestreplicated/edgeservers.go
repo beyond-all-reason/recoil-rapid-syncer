@@ -15,6 +15,8 @@ import (
 	"github.com/p2004a/spring-rapid-syncer/pkg/bunny"
 )
 
+const GCS_STORAGE_EDGE_FILE = "storageEdgeMap.json"
+
 type BunnyEdgeServer struct {
 	IP, ServerRegion, StorageServerRegion string
 	Error                                 error
@@ -66,9 +68,10 @@ func resolveBunnyEdgeServers(ctx context.Context, servers []string, markerUrl st
 	return edgeServers
 }
 
-type ServersMap map[string][]string
+// StorageEdgeMap is a map of storage server region to list of edge servers.
+type StorageEdgeMap map[string][]string
 
-func (s *Server) buildEdgeServersMap(ctx context.Context) (ServersMap, error) {
+func (s *Server) buildStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error) {
 	regions, err := s.bunny.Regions(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get bunny regions: %w", err)
@@ -116,86 +119,86 @@ func (s *Server) buildEdgeServersMap(ctx context.Context) (ServersMap, error) {
 	return sm, nil
 }
 
-func (s *Server) fetchEdgeServersMapFromGCS(ctx context.Context) (ServersMap, error) {
+func (s *Server) fetchStorageEdgeMapFromGCS(ctx context.Context) (StorageEdgeMap, error) {
 	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
-	obj := s.gcsClient.Bucket(s.gcsCacheBucket).Object("serversMap.json")
+	obj := s.gcsClient.Bucket(s.gcsCacheBucket).Object(GCS_STORAGE_EDGE_FILE)
 	attrs, err := obj.Attrs(ctx)
 	if err != nil && err != storage.ErrObjectNotExist {
-		return nil, fmt.Errorf("getting serversMap.json attrs failed: %w", err)
+		return nil, fmt.Errorf("getting %s attrs failed: %w", GCS_STORAGE_EDGE_FILE, err)
 	}
-	if err == storage.ErrObjectNotExist || attrs.Updated.Before(time.Now().Add(-s.serverMapCacheDuration)) {
+	if err == storage.ErrObjectNotExist || attrs.Updated.Before(time.Now().Add(-s.storageEdgeMapCacheDuration)) {
 		return nil, nil
 	}
 	r, err := obj.NewReader(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("creating serversMap.json reader: %w", err)
+		return nil, fmt.Errorf("creating %s reader: %w", GCS_STORAGE_EDGE_FILE, err)
 	}
-	sm := make(ServersMap)
+	sm := make(StorageEdgeMap)
 	decoder := json.NewDecoder(r)
 	if err := decoder.Decode(&sm); err != nil {
-		return nil, fmt.Errorf("failed to decode json for servers map: %w", err)
+		return nil, fmt.Errorf("failed to decode json for storage edge map: %w", err)
 	}
 	return sm, nil
 }
 
-func (s *Server) saveEdgeServersMapToGCS(ctx context.Context, sm ServersMap) error {
+func (s *Server) saveStorageEdgeMapToGCS(ctx context.Context, sm StorageEdgeMap) error {
 	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
-	obj := s.gcsClient.Bucket(s.gcsCacheBucket).Object("serversMap.json")
+	obj := s.gcsClient.Bucket(s.gcsCacheBucket).Object(GCS_STORAGE_EDGE_FILE)
 	w := obj.NewWriter(ctx)
 	enc := json.NewEncoder(w)
 	if err := enc.Encode(sm); err != nil {
-		return fmt.Errorf("failed to encode serversMap: %w", err)
+		return fmt.Errorf("failed to encode %s: %w", GCS_STORAGE_EDGE_FILE, err)
 	}
 	if err := w.Close(); err != nil {
-		return fmt.Errorf("failed to write serversMap to GCS: %w", err)
+		return fmt.Errorf("failed to write %s to GCS: %w", GCS_STORAGE_EDGE_FILE, err)
 	}
 	return nil
 }
 
-func (s *Server) fetchEdgeServersMap(ctx context.Context) (ServersMap, error) {
+func (s *Server) fetchStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error) {
 	if s.gcsClient != nil {
-		sm, err := s.fetchEdgeServersMapFromGCS(ctx)
+		sm, err := s.fetchStorageEdgeMapFromGCS(ctx)
 		if err != nil {
 			log.Printf("WARN: fetching from GCS failed: %v", err)
 		} else if sm != nil {
-			log.Printf("INFO: loaded serversMap.json from GCS")
+			log.Printf("INFO: loaded %s from GCS", GCS_STORAGE_EDGE_FILE)
 			return sm, nil
 		}
 	}
-	sm, err := s.buildEdgeServersMap(ctx)
+	sm, err := s.buildStorageEdgeMap(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("build edge server map: %w", err)
 	}
 	if s.gcsClient != nil {
-		if err := s.saveEdgeServersMapToGCS(ctx, sm); err != nil {
+		if err := s.saveStorageEdgeMapToGCS(ctx, sm); err != nil {
 			log.Printf("WARN: failed to save to GCS: %v", err)
 		} else {
-			log.Printf("INFO: saved serversMap.json to GCS")
+			log.Printf("INFO: saved %s to GCS", GCS_STORAGE_EDGE_FILE)
 		}
 	}
 	return sm, nil
 }
 
-func (s *Server) sfFetchEdgeServersMap(ctx context.Context) (ServersMap, error) {
-	return s.serversMapCache.Get(ctx, func() (ServersMap, error) {
+func (s *Server) sfFetchStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error) {
+	return s.storageEdgeMapCache.Get(ctx, func() (StorageEdgeMap, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return s.fetchEdgeServersMap(ctx)
+		return s.fetchStorageEdgeMap(ctx)
 	})
 }
 
-func (s *Server) HandleServerMap(w http.ResponseWriter, r *http.Request) {
+func (s *Server) HandleStorageEdgeMap(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		log.Printf("Got %s, not GET request for URL: %v", r.Method, r.URL)
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	serversMap, err := s.sfFetchEdgeServersMap(r.Context())
+	serversMap, err := s.sfFetchStorageEdgeMap(r.Context())
 	if err != nil {
-		log.Printf("Failed to get edge server map: %v", err)
+		log.Printf("Failed to get storage edge server map: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
