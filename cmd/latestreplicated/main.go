@@ -135,7 +135,8 @@ func (s *Server) buildEdgeServersMap(ctx context.Context) (ServersMap, error) {
 		}
 		storageReg, ok := regByCode[serv.StorageServerRegion]
 		if !ok {
-			return nil, fmt.Errorf("failed to find region for storage region %s", serv.StorageServerRegion)
+			log.Printf("WARN: Failed to find region for storage region %s", serv.StorageServerRegion)
+			continue
 		}
 		if bunny.RegionsDistanceKm(edgeReg, storageReg) <= s.maxRegionDistanceKm {
 			sm[serv.StorageServerRegion] = append(sm[serv.StorageServerRegion], serv.IP)

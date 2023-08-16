@@ -39,7 +39,7 @@ func NewClient(accessKey string) *Client {
 const ClientUserAgent = "go-bunnyapi-client 1.0"
 
 var (
-	serverRE        = regexp.MustCompile(`^BunnyCDN-([A-Z]+\d*)-(\d+)$`)
+	serverRE        = regexp.MustCompile(`^BunnyCDN-([A-Z]+\d*)1-(\d+)$`)
 	storageServerRE = regexp.MustCompile(`^([A-Z]+)-(\d+)$`)
 )
 
