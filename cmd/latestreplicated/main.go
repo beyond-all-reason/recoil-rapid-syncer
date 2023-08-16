@@ -409,7 +409,7 @@ func main() {
 
 	versionsGzUrl := os.Getenv("VERSIONS_GZ_URL")
 	if versionsGzUrl == "" {
-		versionsGzUrl = "https://bar-rapid.p2004a.com/byar/versions.gz"
+		versionsGzUrl = "https://repos-cdn.beyondallreason.dev/byar/versions.gz"
 	}
 
 	maxRegionDistance := os.Getenv("MAX_REGION_DISTANCE_KM")
