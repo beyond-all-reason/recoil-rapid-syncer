@@ -85,7 +85,7 @@ func (s *Server) buildStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch edge servers: %w", err)
 	}
-	servers := resolveBunnyEdgeServers(ctx, serverIPs, s.versionsGzUrl)
+	servers := resolveBunnyEdgeServers(ctx, serverIPs, s.baseUrl+"/empty.txt")
 
 	sm := make(map[string][]string)
 	for _, serv := range servers {
@@ -107,12 +107,12 @@ func (s *Server) buildStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error
 		}
 	}
 
-	for _, expectedSS := range s.expectedStorageServers {
+	for _, expectedSS := range s.expectedStorageRegions {
 		if _, ok := sm[expectedSS]; !ok {
 			return nil, fmt.Errorf("failed to find expected storage server %s", expectedSS)
 		}
 	}
-	if len(sm) > len(s.expectedStorageServers) {
+	if len(sm) > len(s.expectedStorageRegions) {
 		return nil, fmt.Errorf("there are more sotrage servers in map then expected")
 	}
 

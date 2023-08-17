@@ -26,9 +26,11 @@ const UserAgent = "spring-rapid-syncer/latestreplicated 1.0"
 type Server struct {
 	http                        http.Client
 	bunny                       *bunny.Client
+	bunnyStorageZone            *bunny.StorageZoneClient
+	baseUrl                     string
 	versionsGzUrl               string
 	maxRegionDistanceKm         float64
-	expectedStorageServers      []string
+	expectedStorageRegions      []string
 	gcsCacheBucket              string
 	gcsClient                   *storage.Client
 	storageEdgeMapCacheDuration time.Duration
@@ -81,15 +83,25 @@ func (s *Server) HandleLatestReplicated(w http.ResponseWriter, r *http.Request) 
 	io.WriteString(w, out.String())
 }
 
+func getExpectedStorageRegions(ctx context.Context, bunnyClient *bunny.Client, storageZone string) ([]string, error) {
+	zone, err := bunnyClient.StorageZoneByName(ctx, storageZone)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get storage zones: %w", err)
+	}
+	regions := zone.ReplicationRegions[:]
+	regions = append(regions, zone.Region)
+	return regions, nil
+}
+
 func main() {
-	expectedStorageRegions := os.Getenv("EXPECTED_STORAGE_REGIONS")
-	if expectedStorageRegions == "" {
-		log.Fatalf("Missing required env variable EXPECTED_STORAGE_REGIONS")
+	baseUrl := os.Getenv("BASE_URL")
+	if baseUrl == "" {
+		baseUrl = "https://repos-cdn.beyondallreason.dev"
 	}
 
 	versionsGzUrl := os.Getenv("VERSIONS_GZ_URL")
 	if versionsGzUrl == "" {
-		versionsGzUrl = "https://repos-cdn.beyondallreason.dev/byar/versions.gz"
+		versionsGzUrl = baseUrl + "/byar/versions.gz"
 	}
 
 	maxRegionDistance := os.Getenv("MAX_REGION_DISTANCE_KM")
@@ -131,14 +143,37 @@ func main() {
 		storageEdgeMapCacheDurationLocal /= 4
 	}
 
+	bunnyAccessKey := os.Getenv("BUNNY_ACCESS_KEY")
+	if bunnyAccessKey == "" {
+		log.Fatalf("Missing required env variable BUNNY_ACCESS_KEY")
+	}
+	bunnyClient := bunny.NewClient(bunnyAccessKey)
+
+	bunnyStorageZone := os.Getenv("BUNNY_STORAGE_ZONE")
+	if bunnyStorageZone == "" {
+		log.Fatalf("Missing required env variable BUNNY_STORAGE_ZONE")
+	}
+
+	bunnyStorageZoneClient, err := bunnyClient.NewStorageZoneClient(ctx, bunnyStorageZone)
+	if err != nil {
+		log.Fatalf("Failed to create Bunny storage zone client: %v", err)
+	}
+
+	expectedStorageRegions, err := getExpectedStorageRegions(ctx, bunnyClient, bunnyStorageZone)
+	if err != nil {
+		log.Fatalf("Failed to get expected storage regions: %v", err)
+	}
+
 	server := &Server{
 		http: http.Client{
 			Timeout: time.Second * 5,
 		},
-		bunny:                       bunny.NewClient(""),
+		bunny:                       bunnyClient,
+		bunnyStorageZone:            bunnyStorageZoneClient,
+		baseUrl:                     baseUrl,
 		versionsGzUrl:               versionsGzUrl,
 		maxRegionDistanceKm:         maxRegionDistancFloat,
-		expectedStorageServers:      strings.Split(expectedStorageRegions, ","),
+		expectedStorageRegions:      expectedStorageRegions,
 		gcsCacheBucket:              gcsCacheBucket,
 		gcsClient:                   gcsClient,
 		storageEdgeMapCacheDuration: storageEdgeMapCacheDuration,
@@ -153,6 +188,7 @@ func main() {
 	http.HandleFunc("/storageedgemap", server.HandleStorageEdgeMap)
 	http.HandleFunc("/latestreplicated", server.HandleLatestReplicated)
 	http.HandleFunc("/versions.gz", server.HandleVersionsGz)
+	http.HandleFunc("/updatereplicationcanary", server.HandleUpdateReplicationCanary)
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
