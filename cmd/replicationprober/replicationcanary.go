@@ -53,7 +53,7 @@ func (s *Server) fetchReplicatedFileFromIP(ctx context.Context, ip, expectedSS s
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "spring-rapid-syncer/latestreplicated 1.0")
+	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("Cache-Control", "no-cache")
 	resp, err := client.Do(req)
 	if err != nil {

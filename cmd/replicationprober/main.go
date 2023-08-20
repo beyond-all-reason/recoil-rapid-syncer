@@ -15,7 +15,7 @@ import (
 	"github.com/p2004a/spring-rapid-syncer/pkg/sfcache"
 )
 
-const UserAgent = "spring-rapid-syncer/latestreplicated 1.0"
+const UserAgent = "spring-rapid-syncer/prober 1.0"
 
 type Server struct {
 	http                           http.Client
