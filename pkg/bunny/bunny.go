@@ -235,10 +235,7 @@ func (sz *StorageZoneClient) getFileUrl(filePath string) string {
 	return apiUrl
 }
 
-func sha256AndLengthFromReader(r interface {
-	io.Seeker
-	io.Reader
-}) ([]byte, int64, error) {
+func sha256AndLengthFromReader(r io.ReadSeeker) ([]byte, int64, error) {
 	pos, err := r.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return nil, 0, err
@@ -258,10 +255,7 @@ func (sz *StorageZoneClient) Upload(ctx context.Context, filePath string, conten
 	var err error
 	var contentsHash []byte = nil
 	var contentsLength int64 = 0
-	if v, ok := contents.(interface {
-		io.Seeker
-		io.Reader
-	}); ok {
+	if v, ok := contents.(io.ReadSeeker); ok {
 		contentsHash, contentsLength, err = sha256AndLengthFromReader(v)
 		if err != nil {
 			return err

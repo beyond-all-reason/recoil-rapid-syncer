@@ -2,20 +2,30 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"cloud.google.com/go/storage"
 	"github.com/p2004a/spring-rapid-syncer/pkg/bunny"
 )
 
-const GCS_STORAGE_EDGE_FILE = "storageEdgeMap.json"
+func httpClientForAddr(addr string, timeout time.Duration) http.Client {
+	return http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "tcp", addr)
+			},
+			ForceAttemptHTTP2: true,
+		},
+	}
+}
 
 type BunnyEdgeServer struct {
 	IP, ServerRegion, StorageServerRegion string
@@ -71,7 +81,7 @@ func resolveBunnyEdgeServers(ctx context.Context, servers []string, markerUrl st
 // StorageEdgeMap is a map of storage server region to list of edge servers.
 type StorageEdgeMap map[string][]string
 
-func (s *Server) buildStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error) {
+func (s *Server) fetchStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error) {
 	regions, err := s.bunny.Regions(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get bunny regions: %w", err)
@@ -116,69 +126,6 @@ func (s *Server) buildStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error
 		return nil, fmt.Errorf("there are more sotrage servers in map then expected")
 	}
 
-	return sm, nil
-}
-
-func (s *Server) fetchStorageEdgeMapFromGCS(ctx context.Context) (StorageEdgeMap, error) {
-	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
-	defer cancel()
-
-	obj := s.gcsClient.Bucket(s.gcsCacheBucket).Object(GCS_STORAGE_EDGE_FILE)
-	attrs, err := obj.Attrs(ctx)
-	if err != nil && err != storage.ErrObjectNotExist {
-		return nil, fmt.Errorf("getting %s attrs failed: %w", GCS_STORAGE_EDGE_FILE, err)
-	}
-	if err == storage.ErrObjectNotExist || attrs.Updated.Before(time.Now().Add(-s.storageEdgeMapCacheDuration)) {
-		return nil, nil
-	}
-	r, err := obj.NewReader(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("creating %s reader: %w", GCS_STORAGE_EDGE_FILE, err)
-	}
-	sm := make(StorageEdgeMap)
-	decoder := json.NewDecoder(r)
-	if err := decoder.Decode(&sm); err != nil {
-		return nil, fmt.Errorf("failed to decode json for storage edge map: %w", err)
-	}
-	return sm, nil
-}
-
-func (s *Server) saveStorageEdgeMapToGCS(ctx context.Context, sm StorageEdgeMap) error {
-	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
-	defer cancel()
-	obj := s.gcsClient.Bucket(s.gcsCacheBucket).Object(GCS_STORAGE_EDGE_FILE)
-	w := obj.NewWriter(ctx)
-	enc := json.NewEncoder(w)
-	if err := enc.Encode(sm); err != nil {
-		return fmt.Errorf("failed to encode %s: %w", GCS_STORAGE_EDGE_FILE, err)
-	}
-	if err := w.Close(); err != nil {
-		return fmt.Errorf("failed to write %s to GCS: %w", GCS_STORAGE_EDGE_FILE, err)
-	}
-	return nil
-}
-
-func (s *Server) fetchStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error) {
-	if s.gcsClient != nil {
-		sm, err := s.fetchStorageEdgeMapFromGCS(ctx)
-		if err != nil {
-			log.Printf("WARN: fetching from GCS failed: %v", err)
-		} else if sm != nil {
-			log.Printf("INFO: loaded %s from GCS", GCS_STORAGE_EDGE_FILE)
-			return sm, nil
-		}
-	}
-	sm, err := s.buildStorageEdgeMap(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("build edge server map: %w", err)
-	}
-	if s.gcsClient != nil {
-		if err := s.saveStorageEdgeMapToGCS(ctx, sm); err != nil {
-			log.Printf("WARN: failed to save to GCS: %v", err)
-		} else {
-			log.Printf("INFO: saved %s to GCS", GCS_STORAGE_EDGE_FILE)
-		}
-	}
 	return sm, nil
 }
 
