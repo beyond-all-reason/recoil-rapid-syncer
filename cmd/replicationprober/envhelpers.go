@@ -46,3 +46,15 @@ func getRequiredStrEnv(name string) string {
 	}
 	return envStr
 }
+
+func getBoolEnv(name string, defaultValue bool) bool {
+	envStr := os.Getenv(name)
+	if envStr == "" {
+		return defaultValue
+	}
+	envBool, err := strconv.ParseBool(envStr)
+	if err != nil {
+		log.Fatalf("Failed to parse %s: %v", name, err)
+	}
+	return envBool
+}

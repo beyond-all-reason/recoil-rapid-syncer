@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/InfluxCommunity/influxdb3-go/influxdb3"
 	"github.com/p2004a/spring-rapid-syncer/pkg/bunny"
 	"golang.org/x/sync/errgroup"
 )
@@ -27,24 +28,118 @@ const canaryFileName = "replication-canary.txt"
 func (s *Server) startCanaryUpdater(ctx context.Context) {
 	ticker := time.NewTicker(s.refreshReplicationCanaryPeriod)
 	for {
+		c, cancel := context.WithTimeout(ctx, s.refreshReplicationCanaryPeriod/2)
+		start := time.Now()
+		err := s.updateReplicationCanary(c)
+		cancel()
+		var points []*influxdb3.Point
+		if err != nil {
+			log.Printf("WARN: Failed to update replication canary: %v", err)
+			points = append(points,
+				influxdb3.NewPointWithMeasurement("replication_canary_update_result").
+					AddField("total", 1).
+					AddField("error", 1).
+					AddField("ok", 0).
+					SetTimestamp(time.Now()))
+		} else {
+			latency := time.Since(start)
+			points = append(points,
+				influxdb3.NewPointWithMeasurement("replication_canary_update_result").
+					AddField("total", 1).
+					AddField("error", 0).
+					AddField("ok", 1).
+					SetTimestamp(time.Now()),
+				influxdb3.NewPointWithMeasurement("replication_canary_update_latency").
+					AddField("latency", latency.Milliseconds()).
+					SetTimestamp(time.Now()))
+		}
+
+		c, cancel = context.WithTimeout(ctx, s.refreshReplicationCanaryPeriod/3)
+		if err := s.influxdbClient.WritePoints(c, points...); err != nil {
+			log.Printf("WARN: Failed to report replication_canary_update_latency to influxdb: %v", err)
+		}
+		cancel()
+
 		select {
 		case <-ctx.Done():
 			ticker.Stop()
 			return
 		case <-ticker.C:
-			c, cancel := context.WithTimeout(ctx, s.refreshReplicationCanaryPeriod/2)
-			s.updateReplicationCanary(c)
-			cancel()
 		}
 	}
 }
 
-func (s *Server) updateReplicationCanary(ctx context.Context) {
-	contents := strings.NewReader(time.Now().UTC().Format(time.RFC3339))
-	err := s.bunnyStorageZone.Upload(ctx, canaryFileName, contents)
-	if err != nil {
-		log.Printf("ERROR: Failed to upload replication canary: %v", err)
+func (s *Server) startReplicationStatusChecker(ctx context.Context) {
+	ticker := time.NewTicker(s.checkReplicationStatusPeriod)
+	for {
+		select {
+		case <-ctx.Done():
+			ticker.Stop()
+			return
+		case <-ticker.C:
+		}
+
+		c, cancel := context.WithTimeout(ctx, s.checkReplicationStatusPeriod/2)
+		start := time.Now()
+		rs, err := s.fetchReplicationStatus(c)
+		cancel()
+		var points []*influxdb3.Point
+		if err != nil {
+			log.Printf("WARN: Failed to fetch replication status: %v", err)
+			points = append(points,
+				influxdb3.NewPointWithMeasurement("replication_status_check_result").
+					AddField("total", 1).
+					AddField("error", 1).
+					AddField("ok", 0).
+					SetTimestamp(time.Now()))
+		} else {
+			latency := time.Since(start)
+
+			measurementTime := time.Now()
+
+			points = append(points,
+				influxdb3.NewPointWithMeasurement("replication_status_check_result").
+					AddField("total", 1).
+					AddField("error", 0).
+					AddField("ok", 1).
+					SetTimestamp(measurementTime),
+				influxdb3.NewPointWithMeasurement("replication_status_check_latency").
+					AddField("latency", latency.Milliseconds()).
+					SetTimestamp(measurementTime))
+
+			for _, r := range rs {
+				points = append(points,
+					influxdb3.NewPointWithMeasurement("replication_status_state").
+						AddTag("storage_server", r.StorageServer).
+						AddField("replicated", r.Replicated.Unix()).
+						AddField("created", r.Created.Unix()).
+						AddField("unsynced_for", r.UnsyncedFor.Seconds()).
+						SetTimestamp(measurementTime))
+			}
+		}
+
+		c, cancel = context.WithTimeout(ctx, s.checkReplicationStatusPeriod/3)
+		if err := s.influxdbClient.WritePoints(c, points...); err != nil {
+			log.Printf("WARN: Failed to report replication_status_check_latency to influxdb: %v", err)
+		}
+		cancel()
 	}
+}
+
+func (s *Server) updateReplicationCanary(ctx context.Context) error {
+	canary := time.Now().UTC()
+	contents := canary.Format(time.RFC3339)
+
+	err := s.bunnyStorageZone.Upload(ctx, canaryFileName, strings.NewReader(contents))
+	if err != nil {
+		return fmt.Errorf("failed to upload replication canary: %w", err)
+	}
+
+	s.latestCanary.mu.Lock()
+	s.latestCanary.t = canary
+	s.latestCanary.contents = contents
+	s.latestCanary.mu.Unlock()
+	return nil
 }
 
 func (s *Server) fetchReplicatedFileFromIP(ctx context.Context, ip, expectedSS string, filePath string) (*replicatedFile, error) {
@@ -116,6 +211,45 @@ func (s *Server) fetchReplicatedFile(ctx context.Context, filePath string) ([]*r
 	return allVersionsGz, nil
 }
 
+type ReplicationStatus struct {
+	StorageServer string
+	Replicated    time.Time
+	Created       time.Time
+	UnsyncedFor   time.Duration
+}
+
+func (s *Server) fetchReplicationStatus(ctx context.Context) ([]ReplicationStatus, error) {
+	canaryFiles, err := s.fetchReplicatedFile(ctx, "/"+canaryFileName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch lastes versionsGz: %w", err)
+	}
+
+	s.latestCanary.mu.Lock()
+	contents := s.latestCanary.contents
+	canaryTime := s.latestCanary.t
+	s.latestCanary.mu.Unlock()
+
+	rs := make([]ReplicationStatus, len(canaryFiles))
+	sort.Sort(byServerName(canaryFiles))
+	for i, ver := range canaryFiles {
+		created, err := time.Parse(time.RFC3339, string(ver.contents))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse written time: %w", err)
+		}
+		var unsyncedFor time.Duration
+		if contents != "" && string(ver.contents) != contents && canaryTime.Before(created) {
+			unsyncedFor = time.Since(created.Add(s.refreshReplicationCanaryPeriod))
+		}
+		rs[i] = ReplicationStatus{
+			StorageServer: ver.storageServer,
+			Replicated:    ver.lastModified,
+			Created:       created,
+			UnsyncedFor:   unsyncedFor,
+		}
+	}
+	return rs, nil
+}
+
 func (s *Server) HandleReplicationStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		log.Printf("Got %s, not GET request for URL: %v", r.Method, r.URL)
@@ -123,18 +257,17 @@ func (s *Server) HandleReplicationStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	canaryFiles, err := s.fetchReplicatedFile(r.Context(), "/"+canaryFileName)
+	rs, err := s.fetchReplicationStatus(r.Context())
 	if err != nil {
-		log.Printf("Failed to fetch lastes versionsGz: %v", err)
+		log.Printf("Failed to fetch replication status: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
 	var out strings.Builder
-	sort.Sort(byServerName(canaryFiles))
-	for _, ver := range canaryFiles {
-		out.WriteString(fmt.Sprintf("%s: \n  etag: %s\n  last-modified: %s\n  contents: %s\n",
-			ver.storageServer, ver.etag, ver.lastModified.Format(http.TimeFormat), string(ver.contents)))
+	for _, ver := range rs {
+		out.WriteString(fmt.Sprintf("%s: \n  created: %s\n  replicated: %s\n  unsynced for: %s\n",
+			ver.StorageServer, ver.Created, ver.Replicated, ver.UnsyncedFor))
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

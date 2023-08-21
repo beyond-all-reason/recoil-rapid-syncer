@@ -9,13 +9,21 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
+	"github.com/InfluxCommunity/influxdb3-go/influxdb3"
 	"github.com/p2004a/spring-rapid-syncer/pkg/bunny"
 	"github.com/p2004a/spring-rapid-syncer/pkg/sfcache"
 )
 
 const UserAgent = "spring-rapid-syncer/prober 1.0"
+
+type Canary struct {
+	mu       sync.Mutex
+	contents string
+	t        time.Time
+}
 
 type Server struct {
 	http                           http.Client
@@ -27,6 +35,9 @@ type Server struct {
 	storageEdgeMapCache            sfcache.Cache[StorageEdgeMap]
 	versionsGzCache                sfcache.Cache[[]*replicatedFile]
 	refreshReplicationCanaryPeriod time.Duration
+	checkReplicationStatusPeriod   time.Duration
+	influxdbClient                 *influxdb3.Client
+	latestCanary                   Canary
 }
 
 func getExpectedStorageRegions(ctx context.Context, bunnyClient *bunny.Client, storageZone string) ([]string, error) {
@@ -55,6 +66,15 @@ func main() {
 		log.Fatalf("Failed to get expected storage regions: %v", err)
 	}
 
+	influxdbClient, err := influxdb3.New(influxdb3.ClientConfig{
+		Host:     getRequiredStrEnv("INFLUXDB_URL"),
+		Token:    getRequiredStrEnv("INFLUXDB_TOKEN"),
+		Database: getRequiredStrEnv("INFLUXDB_DATABASE"),
+	})
+	if err != nil {
+		log.Fatalf("Failed to create InfluxDB client: %v", err)
+	}
+
 	server := &Server{
 		http: http.Client{
 			Timeout: time.Second * 5,
@@ -71,13 +91,18 @@ func main() {
 			Timeout: getDurationEnv("VERSION_GZ_CACHE_DURATION", time.Second*10),
 		},
 		refreshReplicationCanaryPeriod: getDurationEnv("REFRESH_REPLICATION_CANARY_PERIOD", time.Minute*5),
+		checkReplicationStatusPeriod:   getDurationEnv("CHECK_REPLICATION_STATUS_PERIOD", time.Minute*2),
+		influxdbClient:                 influxdbClient,
 	}
 
 	http.HandleFunc("/storageedgemap", server.HandleStorageEdgeMap)
 	http.HandleFunc("/replicationstatus_versionsgz", server.HandleReplicationStatusVersionsGz)
 	http.HandleFunc("/replicationstatus", server.HandleReplicationStatus)
 
-	go server.startCanaryUpdater(ctx)
+	if getBoolEnv("ENABLE_STORAGE_REPLICATION_PROBER", true) {
+		go server.startCanaryUpdater(ctx)
+		go server.startReplicationStatusChecker(ctx)
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
