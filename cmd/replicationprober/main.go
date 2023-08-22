@@ -104,6 +104,18 @@ func main() {
 		go server.startReplicationStatusChecker(ctx)
 	}
 
+	redirectProber := &RedirectProber{
+		bunny:                   bunnyClient,
+		influxdbClient:          influxdbClient,
+		repo:                    versionsGzRepo,
+		versionGzUrl:            server.baseUrl + versionsGzFile,
+		probePeriod:             getDurationEnv("CHECK_REDIRECT_STATUS_PERIOD", time.Minute*2),
+		edgeServerRefreshPeriod: time.Hour * 1,
+	}
+	if getBoolEnv("ENABLE_REDIRECT_STATUS_PROBER", true) {
+		go redirectProber.startProber(ctx)
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"

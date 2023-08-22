@@ -11,7 +11,8 @@ import (
 	"time"
 )
 
-const versionsGzFile = "/byar/versions.gz"
+const versionsGzRepo = "byar"
+const versionsGzFile = "/" + versionsGzRepo + "/versions.gz"
 
 func (s *Server) sfFetchLatestSyncedVersionsGZ(ctx context.Context) ([]*replicatedFile, error) {
 	return s.versionsGzCache.Get(ctx, func() ([]*replicatedFile, error) {
