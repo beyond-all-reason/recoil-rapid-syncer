@@ -136,7 +136,6 @@ func (s *Server) updateReplicationCanary(ctx context.Context) error {
 	}
 
 	s.latestCanary.mu.Lock()
-	s.latestCanary.t = canary
 	s.latestCanary.contents = contents
 	s.latestCanary.mu.Unlock()
 	return nil
@@ -225,19 +224,21 @@ func (s *Server) fetchReplicationStatus(ctx context.Context) ([]ReplicationStatu
 	}
 
 	s.latestCanary.mu.Lock()
-	contents := s.latestCanary.contents
-	canaryTime := s.latestCanary.t
+	localContents := s.latestCanary.contents
 	s.latestCanary.mu.Unlock()
+	localCreated, _ := time.Parse(time.RFC3339, localContents)
 
 	rs := make([]ReplicationStatus, len(canaryFiles))
 	sort.Sort(byServerName(canaryFiles))
 	for i, ver := range canaryFiles {
-		created, err := time.Parse(time.RFC3339, string(ver.contents))
+		contents := string(ver.contents)
+		created, err := time.Parse(time.RFC3339, contents)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse written time: %w", err)
 		}
 		var unsyncedFor time.Duration
-		if contents != "" && string(ver.contents) != contents && canaryTime.Before(created) {
+		if localContents != "" &&
+			created.Before(localCreated) {
 			unsyncedFor = time.Since(created.Add(s.refreshReplicationCanaryPeriod))
 		}
 		rs[i] = ReplicationStatus{

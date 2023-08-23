@@ -22,7 +22,6 @@ const UserAgent = "spring-rapid-syncer/prober 1.0"
 type Canary struct {
 	mu       sync.Mutex
 	contents string
-	t        time.Time
 }
 
 type Server struct {
