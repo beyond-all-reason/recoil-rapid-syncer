@@ -8,11 +8,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
 	"github.com/InfluxCommunity/influxdb3-go/influxdb3"
+	"github.com/caarlos0/env/v9"
 	"github.com/p2004a/spring-rapid-syncer/pkg/bunny"
 	"github.com/p2004a/spring-rapid-syncer/pkg/sfcache"
 )
@@ -49,26 +49,55 @@ func getExpectedStorageRegions(ctx context.Context, bunnyClient *bunny.Client, s
 	return regions, nil
 }
 
-func main() {
-	bunnyAccessKey := getRequiredStrEnv("BUNNY_ACCESS_KEY")
-	bunnyClient := bunny.NewClient(bunnyAccessKey)
+type config struct {
+	Bunny struct {
+		AccessKey   string
+		StorageZone string
+	} `envPrefix:"BUNNY_"`
+	InfluxDb struct {
+		Url      string
+		Token    string
+		Database string
+	} `envPrefix:"INFLUXDB_"`
+	BaseUrl                        string        `envDefault:"https://repos-cdn.beyondallreason.dev"`
+	MaxRegionDistanceKm            float64       `envDefault:"400"`
+	StorageEdgeMapCacheDuration    time.Duration `envDefault:"24h"`
+	VersionGzCacheDuration         time.Duration `envDefault:"10s"`
+	RefreshReplicationCanaryPeriod time.Duration `envDefault:"5m"`
+	CheckReplicationStatusPeriod   time.Duration `envDefault:"2m"`
+	CheckRedirectStatusPeriod      time.Duration `envDefault:"2m"`
+	EnableStorageReplicationProber bool          `envDefault:"true"`
+	EnableRedirectStatusProber     bool          `envDefault:"true"`
+	Port                           string        `envDefault:"8080"`
+}
 
-	bunnyStorageZone := getRequiredStrEnv("BUNNY_STORAGE_ZONE")
+func main() {
+	cfg := config{}
+	if err := env.ParseWithOptions(&cfg, env.Options{
+		RequiredIfNoDef:       true,
+		UseFieldNameByDefault: true,
+	}); err != nil {
+		log.Fatalf("%+v\n", err)
+
+	}
+
+	bunnyClient := bunny.NewClient(cfg.Bunny.AccessKey)
+
 	ctx := context.Background()
-	bunnyStorageZoneClient, err := bunnyClient.NewStorageZoneClient(ctx, bunnyStorageZone)
+	bunnyStorageZoneClient, err := bunnyClient.NewStorageZoneClient(ctx, cfg.Bunny.StorageZone)
 	if err != nil {
 		log.Fatalf("Failed to create Bunny storage zone client: %v", err)
 	}
 
-	expectedStorageRegions, err := getExpectedStorageRegions(ctx, bunnyClient, bunnyStorageZone)
+	expectedStorageRegions, err := getExpectedStorageRegions(ctx, bunnyClient, cfg.Bunny.StorageZone)
 	if err != nil {
 		log.Fatalf("Failed to get expected storage regions: %v", err)
 	}
 
 	influxdbClient, err := influxdb3.New(influxdb3.ClientConfig{
-		Host:     getRequiredStrEnv("INFLUXDB_URL"),
-		Token:    getRequiredStrEnv("INFLUXDB_TOKEN"),
-		Database: getRequiredStrEnv("INFLUXDB_DATABASE"),
+		Host:     cfg.InfluxDb.Url,
+		Token:    cfg.InfluxDb.Token,
+		Database: cfg.InfluxDb.Database,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create InfluxDB client: %v", err)
@@ -80,17 +109,17 @@ func main() {
 		},
 		bunny:                  bunnyClient,
 		bunnyStorageZone:       bunnyStorageZoneClient,
-		baseUrl:                getStrEnv("BASE_URL", "https://repos-cdn.beyondallreason.dev"),
-		maxRegionDistanceKm:    getFloatEnv("MAX_REGION_DISTANCE_KM", 400),
+		baseUrl:                cfg.BaseUrl,
+		maxRegionDistanceKm:    cfg.MaxRegionDistanceKm,
 		expectedStorageRegions: expectedStorageRegions,
 		storageEdgeMapCache: sfcache.Cache[StorageEdgeMap]{
-			Timeout: getDurationEnv("STORAGE_EDGE_MAP_CACHE_DURATION", time.Hour*24),
+			Timeout: cfg.StorageEdgeMapCacheDuration,
 		},
 		versionsGzCache: sfcache.Cache[[]*replicatedFile]{
-			Timeout: getDurationEnv("VERSION_GZ_CACHE_DURATION", time.Second*10),
+			Timeout: cfg.VersionGzCacheDuration,
 		},
-		refreshReplicationCanaryPeriod: getDurationEnv("REFRESH_REPLICATION_CANARY_PERIOD", time.Minute*5),
-		checkReplicationStatusPeriod:   getDurationEnv("CHECK_REPLICATION_STATUS_PERIOD", time.Minute*2),
+		refreshReplicationCanaryPeriod: cfg.RefreshReplicationCanaryPeriod,
+		checkReplicationStatusPeriod:   cfg.CheckRedirectStatusPeriod,
 		influxdbClient:                 influxdbClient,
 	}
 
@@ -98,7 +127,7 @@ func main() {
 	http.HandleFunc("/replicationstatus_versionsgz", server.HandleReplicationStatusVersionsGz)
 	http.HandleFunc("/replicationstatus", server.HandleReplicationStatus)
 
-	if getBoolEnv("ENABLE_STORAGE_REPLICATION_PROBER", true) {
+	if cfg.EnableStorageReplicationProber {
 		go server.startCanaryUpdater(ctx)
 		go server.startReplicationStatusChecker(ctx)
 	}
@@ -108,19 +137,14 @@ func main() {
 		influxdbClient:          influxdbClient,
 		repo:                    versionsGzRepo,
 		versionGzUrl:            server.baseUrl + versionsGzFile,
-		probePeriod:             getDurationEnv("CHECK_REDIRECT_STATUS_PERIOD", time.Minute*2),
+		probePeriod:             cfg.CheckRedirectStatusPeriod,
 		edgeServerRefreshPeriod: time.Hour * 1,
 	}
-	if getBoolEnv("ENABLE_REDIRECT_STATUS_PROBER", true) {
+	if cfg.EnableRedirectStatusProber {
 		go redirectProber.startProber(ctx)
 	}
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-		log.Printf("Defaulting to port %s", port)
-	}
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	if err := http.ListenAndServe(":"+cfg.Port, nil); err != nil {
 		log.Fatal(err)
 	}
 }
