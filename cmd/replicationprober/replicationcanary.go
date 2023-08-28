@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2023 Marek Rusinowski
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
