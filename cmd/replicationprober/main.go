@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/InfluxCommunity/influxdb3-go/influxdb3"
@@ -19,25 +18,8 @@ import (
 
 const UserAgent = "spring-rapid-syncer/prober 1.0"
 
-type Canary struct {
-	mu       sync.Mutex
-	contents string
-}
-
-type Server struct {
-	http                           http.Client
-	bunny                          *bunny.Client
-	bunnyStorageZone               *bunny.StorageZoneClient
-	baseUrl                        string
-	maxRegionDistanceKm            float64
-	expectedStorageRegions         []string
-	storageEdgeMapCache            sfcache.Cache[StorageEdgeMap]
-	versionsGzCache                sfcache.Cache[[]*replicatedFile]
-	refreshReplicationCanaryPeriod time.Duration
-	checkReplicationStatusPeriod   time.Duration
-	influxdbClient                 *influxdb3.Client
-	latestCanary                   Canary
-}
+const versionsGzRepo = "byar"
+const versionsGzFile = "/" + versionsGzRepo + "/versions.gz"
 
 func getExpectedStorageRegions(ctx context.Context, bunnyClient *bunny.Client, storageZone string) ([]string, error) {
 	zone, err := bunnyClient.StorageZoneByName(ctx, storageZone)
@@ -103,46 +85,52 @@ func main() {
 		log.Fatalf("Failed to create InfluxDB client: %v", err)
 	}
 
-	server := &Server{
-		http: http.Client{
-			Timeout: time.Second * 5,
-		},
-		bunny:                  bunnyClient,
-		bunnyStorageZone:       bunnyStorageZoneClient,
-		baseUrl:                cfg.BaseUrl,
-		maxRegionDistanceKm:    cfg.MaxRegionDistanceKm,
-		expectedStorageRegions: expectedStorageRegions,
+	rf := &ReplicatedFetcher{
+		bunny: bunnyClient,
 		storageEdgeMapCache: sfcache.Cache[StorageEdgeMap]{
 			Timeout: cfg.StorageEdgeMapCacheDuration,
 		},
-		versionsGzCache: sfcache.Cache[[]*replicatedFile]{
-			Timeout: cfg.VersionGzCacheDuration,
-		},
+		maxRegionDistanceKm:    cfg.MaxRegionDistanceKm,
+		expectedStorageRegions: expectedStorageRegions,
+		probeFileUrl:           cfg.BaseUrl + "/empty.txt",
+	}
+	http.HandleFunc("/storageedgemap", rf.HandleStorageEdgeMap)
+
+	srp := &StorageReplicationProber{
+		replicatedFetcher:              rf,
+		bunnyStorageZone:               bunnyStorageZoneClient,
+		influxdbClient:                 influxdbClient,
 		refreshReplicationCanaryPeriod: cfg.RefreshReplicationCanaryPeriod,
 		checkReplicationStatusPeriod:   cfg.CheckRedirectStatusPeriod,
-		influxdbClient:                 influxdbClient,
+		canaryFileUrl:                  cfg.BaseUrl + "/replication-canary.txt",
+		canaryFileName:                 "replication-canary.txt",
 	}
-
-	http.HandleFunc("/storageedgemap", server.HandleStorageEdgeMap)
-	http.HandleFunc("/replicationstatus_versionsgz", server.HandleReplicationStatusVersionsGz)
-	http.HandleFunc("/replicationstatus", server.HandleReplicationStatus)
-
 	if cfg.EnableStorageReplicationProber {
-		go server.startCanaryUpdater(ctx)
-		go server.startReplicationStatusChecker(ctx)
+		go srp.startCanaryUpdater(ctx)
+		go srp.startReplicationStatusChecker(ctx)
 	}
+	http.HandleFunc("/replicationstatus", srp.HandleReplicationStatus)
 
 	redirectProber := &RedirectProber{
 		bunny:                   bunnyClient,
 		influxdbClient:          influxdbClient,
 		repo:                    versionsGzRepo,
-		versionGzUrl:            server.baseUrl + versionsGzFile,
+		versionGzUrl:            cfg.BaseUrl + versionsGzFile,
 		probePeriod:             cfg.CheckRedirectStatusPeriod,
 		edgeServerRefreshPeriod: time.Hour * 1,
 	}
 	if cfg.EnableRedirectStatusProber {
 		go redirectProber.startProber(ctx)
 	}
+
+	versionGzFetcher := &VersionGzFetcher{
+		replicatedFetcher: rf,
+		versionGzUrl:      cfg.BaseUrl + versionsGzFile,
+		versionsGzCache: sfcache.Cache[[]*ReplicatedFile]{
+			Timeout: cfg.VersionGzCacheDuration,
+		},
+	}
+	http.HandleFunc("/replicationstatus_versiongz", versionGzFetcher.HandleReplicationStatusVersionsGz)
 
 	if err := http.ListenAndServe(":"+cfg.Port, nil); err != nil {
 		log.Fatal(err)

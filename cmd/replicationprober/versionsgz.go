@@ -9,26 +9,31 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/p2004a/spring-rapid-syncer/pkg/sfcache"
 )
 
-const versionsGzRepo = "byar"
-const versionsGzFile = "/" + versionsGzRepo + "/versions.gz"
+type VersionGzFetcher struct {
+	replicatedFetcher *ReplicatedFetcher
+	versionGzUrl      string
+	versionsGzCache   sfcache.Cache[[]*ReplicatedFile]
+}
 
-func (s *Server) sfFetchLatestSyncedVersionsGZ(ctx context.Context) ([]*replicatedFile, error) {
-	return s.versionsGzCache.Get(ctx, func() ([]*replicatedFile, error) {
+func (s *VersionGzFetcher) sfFetchLatestSyncedVersionsGZ(ctx context.Context) ([]*ReplicatedFile, error) {
+	return s.versionsGzCache.Get(ctx, func() ([]*ReplicatedFile, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
-		return s.fetchReplicatedFile(ctx, versionsGzFile)
+		return s.replicatedFetcher.FetchReplicatedFile(ctx, s.versionGzUrl)
 	})
 }
 
-type byServerName []*replicatedFile
+type byServerName []*ReplicatedFile
 
 func (s byServerName) Len() int           { return len(s) }
-func (s byServerName) Less(i, j int) bool { return s[i].storageServer < s[i].storageServer }
+func (s byServerName) Less(i, j int) bool { return s[i].storageServer < s[j].storageServer }
 func (s byServerName) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
-func (s *Server) HandleReplicationStatusVersionsGz(w http.ResponseWriter, r *http.Request) {
+func (s *VersionGzFetcher) HandleReplicationStatusVersionsGz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		log.Printf("Got %s, not GET request for URL: %v", r.Method, r.URL)
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)

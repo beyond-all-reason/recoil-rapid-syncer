@@ -5,27 +5,32 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net/http"
-	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/InfluxCommunity/influxdb3-go/influxdb3"
 	"github.com/p2004a/spring-rapid-syncer/pkg/bunny"
-	"golang.org/x/sync/errgroup"
 )
 
-type replicatedFile struct {
-	contents      []byte
-	lastModified  time.Time
-	etag          string
-	storageServer string
+type Canary struct {
+	mu       sync.Mutex
+	contents string
 }
 
-const canaryFileName = "replication-canary.txt"
+type StorageReplicationProber struct {
+	replicatedFetcher              *ReplicatedFetcher
+	bunnyStorageZone               *bunny.StorageZoneClient
+	influxdbClient                 *influxdb3.Client
+	latestCanary                   Canary
+	refreshReplicationCanaryPeriod time.Duration
+	checkReplicationStatusPeriod   time.Duration
+	canaryFileUrl                  string
+	canaryFileName                 string
+}
 
-func (s *Server) startCanaryUpdater(ctx context.Context) {
+func (s *StorageReplicationProber) startCanaryUpdater(ctx context.Context) {
 	ticker := time.NewTicker(s.refreshReplicationCanaryPeriod)
 	for {
 		c, cancel := context.WithTimeout(ctx, s.refreshReplicationCanaryPeriod/2)
@@ -69,7 +74,7 @@ func (s *Server) startCanaryUpdater(ctx context.Context) {
 	}
 }
 
-func (s *Server) startReplicationStatusChecker(ctx context.Context) {
+func (s *StorageReplicationProber) startReplicationStatusChecker(ctx context.Context) {
 	ticker := time.NewTicker(s.checkReplicationStatusPeriod)
 	for {
 		select {
@@ -126,11 +131,11 @@ func (s *Server) startReplicationStatusChecker(ctx context.Context) {
 	}
 }
 
-func (s *Server) updateReplicationCanary(ctx context.Context) error {
+func (s *StorageReplicationProber) updateReplicationCanary(ctx context.Context) error {
 	canary := time.Now().UTC()
 	contents := canary.Format(time.RFC3339)
 
-	err := s.bunnyStorageZone.Upload(ctx, canaryFileName, strings.NewReader(contents))
+	err := s.bunnyStorageZone.Upload(ctx, s.canaryFileName, strings.NewReader(contents))
 	if err != nil {
 		return fmt.Errorf("failed to upload replication canary: %w", err)
 	}
@@ -141,9 +146,9 @@ func (s *Server) updateReplicationCanary(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) fetchReplicatedFileFromIP(ctx context.Context, ip, expectedSS string, filePath string) (*replicatedFile, error) {
+func fetchFileFromBunnyIP(ctx context.Context, ip, url string) (*ReplicatedFile, error) {
 	client := httpClientForAddr(ip+":443", time.Second*20)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseUrl+filePath, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -159,15 +164,12 @@ func (s *Server) fetchReplicatedFileFromIP(ctx context.Context, ip, expectedSS s
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("downloading %s failed: %w", filePath, err)
+		return nil, fmt.Errorf("downloading %s failed: %w", url, err)
 	}
 
 	storageServerRegion, err := bunny.StorageServerRegionCode(&resp.Header)
 	if err != nil {
 		return nil, err
-	}
-	if storageServerRegion != expectedSS {
-		return nil, fmt.Errorf("got response from unexpected storage server from edge %s: %s, expected %s", ip, storageServerRegion, expectedSS)
 	}
 
 	modified, err := http.ParseTime(resp.Header.Get("Last-Modified"))
@@ -175,39 +177,12 @@ func (s *Server) fetchReplicatedFileFromIP(ctx context.Context, ip, expectedSS s
 		return nil, fmt.Errorf("failed to parse Last-Modified: %w", err)
 	}
 
-	return &replicatedFile{
+	return &ReplicatedFile{
 		contents:      body,
 		lastModified:  modified,
 		etag:          resp.Header.Get("ETag"),
-		storageServer: expectedSS,
+		storageServer: storageServerRegion,
 	}, nil
-}
-
-func (s *Server) fetchReplicatedFile(ctx context.Context, filePath string) ([]*replicatedFile, error) {
-	grp, subCtx := errgroup.WithContext(ctx)
-
-	serversMap, err := s.sfFetchStorageEdgeMap(subCtx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get edge server map: %w", err)
-	}
-
-	allVersionsGz := make([]*replicatedFile, len(serversMap))
-	i := 0
-	for storageServer, ips := range serversMap {
-		ip := ips[rand.Intn(len(ips))]
-		id := i
-		ss := storageServer
-		grp.Go(func() error {
-			var err error
-			allVersionsGz[id], err = s.fetchReplicatedFileFromIP(subCtx, ip, ss, filePath)
-			return err
-		})
-		i++
-	}
-	if err := grp.Wait(); err != nil {
-		return nil, err
-	}
-	return allVersionsGz, nil
 }
 
 type ReplicationStatus struct {
@@ -217,8 +192,8 @@ type ReplicationStatus struct {
 	UnsyncedFor   time.Duration
 }
 
-func (s *Server) fetchReplicationStatus(ctx context.Context) ([]ReplicationStatus, error) {
-	canaryFiles, err := s.fetchReplicatedFile(ctx, "/"+canaryFileName)
+func (s *StorageReplicationProber) fetchReplicationStatus(ctx context.Context) ([]ReplicationStatus, error) {
+	canaryFiles, err := s.replicatedFetcher.FetchReplicatedFile(ctx, s.canaryFileUrl)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch lastes versionsGz: %w", err)
 	}
@@ -229,7 +204,6 @@ func (s *Server) fetchReplicationStatus(ctx context.Context) ([]ReplicationStatu
 	localCreated, _ := time.Parse(time.RFC3339, localContents)
 
 	rs := make([]ReplicationStatus, len(canaryFiles))
-	sort.Sort(byServerName(canaryFiles))
 	for i, ver := range canaryFiles {
 		contents := string(ver.contents)
 		created, err := time.Parse(time.RFC3339, contents)
@@ -251,7 +225,7 @@ func (s *Server) fetchReplicationStatus(ctx context.Context) ([]ReplicationStatu
 	return rs, nil
 }
 
-func (s *Server) HandleReplicationStatus(w http.ResponseWriter, r *http.Request) {
+func (s *StorageReplicationProber) HandleReplicationStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		log.Printf("Got %s, not GET request for URL: %v", r.Method, r.URL)
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)

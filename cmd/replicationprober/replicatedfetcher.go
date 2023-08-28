@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"strings"
@@ -12,7 +13,24 @@ import (
 	"time"
 
 	"github.com/p2004a/spring-rapid-syncer/pkg/bunny"
+	"github.com/p2004a/spring-rapid-syncer/pkg/sfcache"
+	"golang.org/x/sync/errgroup"
 )
+
+type ReplicatedFile struct {
+	contents      []byte
+	lastModified  time.Time
+	etag          string
+	storageServer string
+}
+
+type ReplicatedFetcher struct {
+	bunny                  *bunny.Client
+	storageEdgeMapCache    sfcache.Cache[StorageEdgeMap]
+	maxRegionDistanceKm    float64
+	expectedStorageRegions []string
+	probeFileUrl           string
+}
 
 func httpClientForAddr(addr string, timeout time.Duration) http.Client {
 	return http.Client{
@@ -81,7 +99,7 @@ func resolveBunnyEdgeServers(ctx context.Context, servers []string, markerUrl st
 // StorageEdgeMap is a map of storage server region to list of edge servers.
 type StorageEdgeMap map[string][]string
 
-func (s *Server) fetchStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error) {
+func (s *ReplicatedFetcher) fetchStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error) {
 	regions, err := s.bunny.Regions(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get bunny regions: %w", err)
@@ -95,7 +113,7 @@ func (s *Server) fetchStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch edge servers: %w", err)
 	}
-	servers := resolveBunnyEdgeServers(ctx, serverIPs, s.baseUrl+"/empty.txt")
+	servers := resolveBunnyEdgeServers(ctx, serverIPs, s.probeFileUrl)
 
 	sm := make(map[string][]string)
 	for _, serv := range servers {
@@ -129,7 +147,7 @@ func (s *Server) fetchStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error
 	return sm, nil
 }
 
-func (s *Server) sfFetchStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error) {
+func (s *ReplicatedFetcher) sfFetchStorageEdgeMap(ctx context.Context) (StorageEdgeMap, error) {
 	return s.storageEdgeMapCache.Get(ctx, func() (StorageEdgeMap, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -137,7 +155,37 @@ func (s *Server) sfFetchStorageEdgeMap(ctx context.Context) (StorageEdgeMap, err
 	})
 }
 
-func (s *Server) HandleStorageEdgeMap(w http.ResponseWriter, r *http.Request) {
+func (s *ReplicatedFetcher) FetchReplicatedFile(ctx context.Context, url string) ([]*ReplicatedFile, error) {
+	grp, subCtx := errgroup.WithContext(ctx)
+
+	serversMap, err := s.sfFetchStorageEdgeMap(subCtx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get edge server map: %w", err)
+	}
+
+	allVersionsGz := make([]*ReplicatedFile, len(serversMap))
+	i := 0
+	for storageServer, ips := range serversMap {
+		ip := ips[rand.Intn(len(ips))]
+		id := i
+		ss := storageServer
+		grp.Go(func() error {
+			var err error
+			allVersionsGz[id], err = fetchFileFromBunnyIP(subCtx, ip, url)
+			if err == nil && allVersionsGz[id].storageServer != ss {
+				err = fmt.Errorf("got response from unexpected storage server from edge %s: %s, expected %s", ip, allVersionsGz[id].storageServer, ss)
+			}
+			return err
+		})
+		i++
+	}
+	if err := grp.Wait(); err != nil {
+		return nil, err
+	}
+	return allVersionsGz, nil
+}
+
+func (s *ReplicatedFetcher) HandleStorageEdgeMap(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		log.Printf("Got %s, not GET request for URL: %v", r.Method, r.URL)
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
