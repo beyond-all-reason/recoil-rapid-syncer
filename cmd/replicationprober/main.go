@@ -50,7 +50,7 @@ type config struct {
 	CheckRedirectStatusPeriod      time.Duration `envDefault:"2m"`
 	EnableStorageReplicationProber bool          `envDefault:"true"`
 	EnableRedirectStatusProber     bool          `envDefault:"true"`
-	Port                           string        `envDefault:"8080"`
+	Port                           string        `envDefault:"disabled"`
 }
 
 func main() {
@@ -60,7 +60,6 @@ func main() {
 		UseFieldNameByDefault: true,
 	}); err != nil {
 		log.Fatalf("%+v\n", err)
-
 	}
 
 	bunnyClient := bunny.NewClient(cfg.Bunny.AccessKey)
@@ -132,7 +131,11 @@ func main() {
 	}
 	http.HandleFunc("/replicationstatus_versiongz", versionGzFetcher.HandleReplicationStatusVersionsGz)
 
-	if err := http.ListenAndServe(":"+cfg.Port, nil); err != nil {
-		log.Fatal(err)
+	if cfg.Port == "disabled" {
+		select {}
+	} else {
+		if err := http.ListenAndServe(":"+cfg.Port, nil); err != nil {
+			log.Fatal(err)
+		}
 	}
 }
