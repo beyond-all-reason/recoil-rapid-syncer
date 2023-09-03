@@ -1,4 +1,4 @@
-FROM docker.io/library/golang:1.18 AS build
+FROM docker.io/library/golang:1.21-bullseye AS build
 
 WORKDIR /go/src/app
 
