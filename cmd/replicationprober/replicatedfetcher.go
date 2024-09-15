@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/p2004a/spring-rapid-syncer/pkg/bunny"
-	"github.com/p2004a/spring-rapid-syncer/pkg/sfcache"
+	"github.com/beyond-all-reason/recoil-rapid-syncer/pkg/bunny"
+	"github.com/beyond-all-reason/recoil-rapid-syncer/pkg/sfcache"
 	"golang.org/x/sync/errgroup"
 )
 

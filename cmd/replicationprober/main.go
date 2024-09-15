@@ -11,12 +11,12 @@ import (
 	"time"
 
 	"github.com/InfluxCommunity/influxdb3-go/influxdb3"
+	"github.com/beyond-all-reason/recoil-rapid-syncer/pkg/bunny"
+	"github.com/beyond-all-reason/recoil-rapid-syncer/pkg/sfcache"
 	"github.com/caarlos0/env/v9"
-	"github.com/p2004a/spring-rapid-syncer/pkg/bunny"
-	"github.com/p2004a/spring-rapid-syncer/pkg/sfcache"
 )
 
-const UserAgent = "spring-rapid-syncer/prober 1.0"
+const UserAgent = "recoil-rapid-syncer/prober 1.0"
 
 const versionsGzRepo = "byar"
 const versionsGzFile = "/" + versionsGzRepo + "/versions.gz"

@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/InfluxCommunity/influxdb3-go/influxdb3"
-	"github.com/p2004a/spring-rapid-syncer/pkg/bunny"
+	"github.com/beyond-all-reason/recoil-rapid-syncer/pkg/bunny"
 )
 
 type RedirectProber struct {

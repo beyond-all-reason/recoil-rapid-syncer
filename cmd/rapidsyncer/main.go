@@ -12,7 +12,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/p2004a/spring-rapid-syncer/pkg/syncer"
+	"github.com/beyond-all-reason/recoil-rapid-syncer/pkg/syncer"
 )
 
 type Server struct {
@@ -61,7 +61,7 @@ func (s *Server) HandleSync(w http.ResponseWriter, r *http.Request) {
 func main() {
 	sourceRapidRepo := os.Getenv("SOURCE_RAPID_REPO")
 	if sourceRapidRepo == "" {
-		sourceRapidRepo = "https://repos.springrts.com/"
+		sourceRapidRepo = "https://repos.beyondallreason.dev/"
 	}
 	bunnyStorageZone := os.Getenv("BUNNY_STORAGE_ZONE")
 	if bunnyStorageZone == "" {

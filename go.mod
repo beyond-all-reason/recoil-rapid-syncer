@@ -1,4 +1,4 @@
-module github.com/p2004a/spring-rapid-syncer
+module github.com/beyond-all-reason/recoil-rapid-syncer
 
 go 1.21
 

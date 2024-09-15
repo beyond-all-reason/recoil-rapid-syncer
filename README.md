@@ -1,6 +1,6 @@
-# Spring RTS Rapid syncer
+# Recoil RTS Rapid syncer
 
-A small stateless utility that can mirror content of a Spring RTS
+A small stateless utility that can mirror content of a Recoil RTS
 [Rapid](https://springrts.com/wiki/Rapid) repository to some other hosting.
 
 Currently it supports [Bunny Edge Storage](https://bunny.net/edge-storage/) as a

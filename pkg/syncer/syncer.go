@@ -63,7 +63,7 @@ func (rs *RapidSyncer) fetchGzipFile(
 	if err != nil {
 		return nil, 0, err
 	}
-	req.Header.Set("User-Agent", "spring-rapid-syncer 1.0")
+	req.Header.Set("User-Agent", "recoil-rapid-syncer 1.0")
 	for header, value := range headers {
 		req.Header.Set(header, value)
 	}
@@ -184,7 +184,7 @@ func (rs *RapidSyncer) uploadFile(ctx context.Context, repo, path string, conten
 		return err
 	}
 	contentsHash := sha256.Sum256(contents)
-	req.Header.Set("User-Agent", "spring-rapid-syncer 1.0")
+	req.Header.Set("User-Agent", "recoil-rapid-syncer 1.0")
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("AccessKey", rs.bunnyAccessKey)
 	req.Header.Set("Checksum", strings.ToUpper(hex.EncodeToString(contentsHash[:])))
@@ -205,7 +205,7 @@ func (rs *RapidSyncer) getAvailableFilesWithPrefix(ctx context.Context, repo str
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "spring-rapid-syncer 1.0")
+	req.Header.Set("User-Agent", "recoil-rapid-syncer 1.0")
 	req.Header.Set("AccessKey", rs.bunnyAccessKey)
 	resp, err := rs.client.Do(req)
 	if err != nil {

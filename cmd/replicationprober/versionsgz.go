@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/p2004a/spring-rapid-syncer/pkg/sfcache"
+	"github.com/beyond-all-reason/recoil-rapid-syncer/pkg/sfcache"
 )
 
 type VersionGzFetcher struct {
