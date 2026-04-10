@@ -21,9 +21,20 @@ import (
 	"github.com/golang/geo/s2"
 )
 
+// StorageZoneOperations defines the operations available on a storage zone.
+// *StorageZoneClient implements this interface. FakeStorageZone provides an
+// in-memory implementation for use in tests.
+type StorageZoneOperations interface {
+	Upload(ctx context.Context, filePath string, contents io.Reader) error
+	Delete(ctx context.Context, filePath string) error
+	Download(ctx context.Context, filePath string) (io.ReadCloser, int, error)
+	List(ctx context.Context, dirPath string) ([]string, error)
+}
+
 type Client struct {
-	accessKey string
-	client    http.Client
+	accessKey  string
+	client     http.Client
+	apiBaseURL string
 }
 
 func NewClient(accessKey string) *Client {
@@ -39,6 +50,7 @@ func NewClient(accessKey string) *Client {
 				DisableCompression:  true,
 			},
 		},
+		apiBaseURL: "https://api.bunny.net",
 	}
 }
 
@@ -50,7 +62,7 @@ var (
 )
 
 func (c *Client) EdgeServersIP(ctx context.Context) ([]string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.bunny.net/system/edgeserverlist", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.apiBaseURL+"/system/edgeserverlist", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +97,7 @@ type Region struct {
 }
 
 func (c *Client) Regions(ctx context.Context) ([]Region, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.bunny.net/region", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.apiBaseURL+"/region", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +142,7 @@ type StorageZone struct {
 }
 
 func (c *Client) StorageZones(ctx context.Context) ([]StorageZone, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.bunny.net/storagezone?perPage=1000", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.apiBaseURL+"/storagezone?perPage=1000", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -195,18 +207,18 @@ func RegionsDistanceKm(a, b *Region) float64 {
 }
 
 type StorageZoneClient struct {
-	client          *Client
-	zoneName        string
-	storageEndpoint string
-	accessKey       string
+	client         *Client
+	zoneName       string
+	accessKey      string
+	storageBaseURL string
 }
 
 func NewStorageZoneClient(zoneName, storageEndpoint, accessKey string) *StorageZoneClient {
 	return &StorageZoneClient{
-		client:          NewClient("invalid"),
-		zoneName:        zoneName,
-		storageEndpoint: storageEndpoint,
-		accessKey:       accessKey,
+		client:         NewClient("invalid"),
+		zoneName:       zoneName,
+		accessKey:      accessKey,
+		storageBaseURL: "https://" + storageEndpoint,
 	}
 }
 
@@ -219,7 +231,7 @@ func (c *Client) NewStorageZoneClient(ctx context.Context, zoneName string) (*St
 	if err != nil {
 		return nil, fmt.Errorf("failed to get storage zone: %w", err)
 	}
-	sz.storageEndpoint = zone.StorageHostname
+	sz.storageBaseURL = "https://" + zone.StorageHostname
 	sz.accessKey = zone.Password
 	return sz, nil
 }
@@ -227,7 +239,7 @@ func (c *Client) NewStorageZoneClient(ctx context.Context, zoneName string) (*St
 func (sz *StorageZoneClient) getFileUrl(filePath string) string {
 	fileName := path.Base(filePath)
 	dir := path.Dir(filePath)
-	apiUrl := "https://" + sz.storageEndpoint + "/" + sz.zoneName + "/"
+	apiUrl := sz.storageBaseURL + "/" + sz.zoneName + "/"
 	if dir != "." && dir != "/" {
 		apiUrl += url.PathEscape(dir) + "/"
 	}
@@ -320,7 +332,7 @@ func (sz *StorageZoneClient) Download(ctx context.Context, filePath string) (io.
 }
 
 func (sz *StorageZoneClient) List(ctx context.Context, dirPath string) ([]string, error) {
-	apiUrl := "https://" + sz.storageEndpoint + "/" + sz.zoneName + "/" + url.PathEscape(dirPath) + "/"
+	apiUrl := sz.storageBaseURL + "/" + sz.zoneName + "/" + url.PathEscape(dirPath) + "/"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiUrl, nil)
 	if err != nil {
 		return nil, err
