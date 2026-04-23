@@ -1,9 +1,10 @@
-// SPDX-FileCopyrightText: 2022 Marek Rusinowski
+// SPDX-FileCopyrightText: 2022,2026 Marek Rusinowski
 // SPDX-License-Identifier: Apache-2.0
 
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,12 +13,13 @@ import (
 	"os"
 	"strings"
 
+	"github.com/beyond-all-reason/recoil-rapid-syncer/pkg/bunny"
 	"github.com/beyond-all-reason/recoil-rapid-syncer/pkg/syncer"
 )
 
 type Server struct {
-	syncer                    *syncer.RapidSyncer
-	srcRepoRoot, destRepoRoot string
+	syncer      *syncer.RapidSyncer
+	srcRepoRoot string
 }
 
 func (s *Server) HandleSync(w http.ResponseWriter, r *http.Request) {
@@ -38,8 +40,7 @@ func (s *Server) HandleSync(w http.ResponseWriter, r *http.Request) {
 	var out strings.Builder
 	for i, repo := range repos {
 		srcRepo := s.srcRepoRoot + repo + "/"
-		dstRepo := s.destRepoRoot + repo + "/"
-		synced[i], err = s.syncer.Sync(r.Context(), srcRepo, dstRepo)
+		synced[i], err = s.syncer.Sync(r.Context(), srcRepo, repo)
 		if err != nil {
 			log.Printf("Failed to sync: %v", err)
 			http.Error(w, "Sync Failed", http.StatusInternalServerError)
@@ -71,10 +72,16 @@ func main() {
 	if bunnyAccessKey == "" {
 		log.Fatalf("Missing required env variable BUNNY_ACCESS_KEY")
 	}
+
+	bunnyClient := bunny.NewClient(bunnyAccessKey)
+	zoneClient, err := bunnyClient.NewStorageZoneClient(context.Background(), bunnyStorageZone)
+	if err != nil {
+		log.Fatalf("Failed to create Bunny storage zone client: %v", err)
+	}
+
 	server := &Server{
-		syncer:       syncer.NewRapidSyncer(bunnyAccessKey),
-		srcRepoRoot:  sourceRapidRepo,
-		destRepoRoot: fmt.Sprintf("https://storage.bunnycdn.com/%s/", bunnyStorageZone),
+		syncer:      syncer.NewRapidSyncer(zoneClient),
+		srcRepoRoot: sourceRapidRepo,
 	}
 
 	http.HandleFunc("/sync", server.HandleSync)

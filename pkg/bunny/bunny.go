@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2023 Marek Rusinowski
+// SPDX-FileCopyrightText: 2023,2026 Marek Rusinowski
 // SPDX-License-Identifier: Apache-2.0
 
 package bunny
