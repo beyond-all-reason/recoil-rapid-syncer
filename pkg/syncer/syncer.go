@@ -11,13 +11,13 @@ import (
 	"encoding/binary"
 	"encoding/csv"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"path"
 	"regexp"
 	"sync"
-	"time"
 
 	"github.com/beyond-all-reason/recoil-rapid-syncer/pkg/bunny"
 )
@@ -32,8 +32,7 @@ type entry struct {
 }
 
 type RapidSyncer struct {
-	client http.Client
-	dst    bunny.StorageZoneOperations
+	dst bunny.StorageZoneOperations
 }
 
 var (
@@ -41,50 +40,28 @@ var (
 )
 
 func NewRapidSyncer(dst bunny.StorageZoneOperations) *RapidSyncer {
-	return &RapidSyncer{
-		client: http.Client{
-			Timeout: time.Second * 10,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxConnsPerHost:     75,
-				MaxIdleConnsPerHost: 75,
-				IdleConnTimeout:     90 * time.Second,
-				DisableCompression:  true,
-			},
-		},
-		dst: dst,
-	}
+	return &RapidSyncer{dst: dst}
 }
 
-func (rs *RapidSyncer) fetchGzipFile(
-	ctx context.Context, url string, headers map[string]string,
-	handler func(io.Reader) error) ([]byte, int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// readGzip opens path from src, tees the raw (gzipped) bytes, decompresses
+// them through handler, and returns the raw gzipped bytes. When src reports
+// the file is missing, the returned error wraps ErrNotFound.
+func readGzip(ctx context.Context, src Source, path string, opts OpenOptions, handler func(io.Reader) error) ([]byte, error) {
+	rc, err := src.Open(ctx, path, opts)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	req.Header.Set("User-Agent", "recoil-rapid-syncer 1.0")
-	for header, value := range headers {
-		req.Header.Set(header, value)
-	}
-	resp, err := rs.client.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, resp.StatusCode, fmt.Errorf("http request failed with code: %d", resp.StatusCode)
-	}
+	defer rc.Close()
 	var buf bytes.Buffer
-	respBody := io.TeeReader(resp.Body, &buf)
-	gzReader, err := gzip.NewReader(respBody)
+	tee := io.TeeReader(rc, &buf)
+	gzReader, err := gzip.NewReader(tee)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to create gzip reader: %v", err)
+		return nil, fmt.Errorf("failed to create gzip reader: %v", err)
 	}
 	if err := handler(gzReader); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	return buf.Bytes(), http.StatusOK, nil
+	return buf.Bytes(), nil
 }
 
 func parseVersions(r io.Reader) ([]archive, error) {
@@ -104,16 +81,15 @@ func parseVersions(r io.Reader) ([]archive, error) {
 	return archives, nil
 }
 
-func (rs *RapidSyncer) fetchSourceVersions(ctx context.Context, srcRepo string) ([]archive, []byte, error) {
+func (rs *RapidSyncer) fetchSourceVersions(ctx context.Context, src Source) ([]archive, []byte, error) {
 	var archives []archive
-	headers := map[string]string{"Cache-Control": "no-cache"}
-	buf, code, err := rs.fetchGzipFile(ctx, srcRepo+"versions.gz", headers, func(r io.Reader) error {
+	buf, err := readGzip(ctx, src, "versions.gz", OpenOptions{NoCache: true}, func(r io.Reader) error {
 		var perr error
 		archives, perr = parseVersions(r)
 		return perr
 	})
-	if code == http.StatusNotFound {
-		return archives, []byte{}, nil
+	if errors.Is(err, ErrNotFound) {
+		return nil, []byte{}, nil
 	}
 	return archives, buf, err
 }
@@ -138,10 +114,9 @@ func archiveFileFromHash(hash string) string {
 	return "packages/" + hash + ".sdp"
 }
 
-func (rs *RapidSyncer) fetchArchive(ctx context.Context, repo, archiveHash string) ([]entry, []byte, error) {
+func (rs *RapidSyncer) fetchArchive(ctx context.Context, src Source, archiveHash string) ([]entry, []byte, error) {
 	var entries []entry
-	url := repo + archiveFileFromHash(archiveHash)
-	buf, _, err := rs.fetchGzipFile(ctx, url, map[string]string{}, func(r io.Reader) error {
+	buf, err := readGzip(ctx, src, archiveFileFromHash(archiveHash), OpenOptions{}, func(r io.Reader) error {
 		sdpData, err := io.ReadAll(r)
 		if err != nil {
 			return err
@@ -181,9 +156,8 @@ func poolFileFromHash(hash string) string {
 	return "pool/" + hash[0:2] + "/" + hash[2:] + ".gz"
 }
 
-func (rs *RapidSyncer) fetchPoolEntry(ctx context.Context, repo, entryHash string) ([]byte, error) {
-	url := repo + poolFileFromHash(entryHash)
-	buf, _, err := rs.fetchGzipFile(ctx, url, map[string]string{}, func(r io.Reader) error {
+func (rs *RapidSyncer) fetchPoolEntry(ctx context.Context, src Source, entryHash string) ([]byte, error) {
+	buf, err := readGzip(ctx, src, poolFileFromHash(entryHash), OpenOptions{}, func(r io.Reader) error {
 		hash := md5.New()
 		_, err := io.Copy(hash, r)
 		if err != nil {
@@ -265,14 +239,14 @@ func (rs *RapidSyncer) getAvailableFiles(ctx context.Context, dstPrefix string) 
 //	[]string - list of hashes of missing sdp archives
 //	[]byte - source versions
 //	error - if there was any error during computation
-func (rs *RapidSyncer) compareVersions(ctx context.Context, srcRepo string, dstPrefix string) (bool, []string, []byte, error) {
+func (rs *RapidSyncer) compareVersions(ctx context.Context, src Source, dstPrefix string) (bool, []string, []byte, error) {
 	var srcArchives, destArchives []archive
 	var srcVersions []byte
 	var srcErr, destErr error
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
-		srcArchives, srcVersions, srcErr = rs.fetchSourceVersions(ctx, srcRepo)
+		srcArchives, srcVersions, srcErr = rs.fetchSourceVersions(ctx, src)
 		wg.Done()
 	}()
 	go func() {
@@ -311,7 +285,7 @@ func (rs *RapidSyncer) compareVersions(ctx context.Context, srcRepo string, dstP
 	return areSame, missingArchives, srcVersions, nil
 }
 
-func (rs *RapidSyncer) syncMissingArchives(ctx context.Context, srcRepo string, dstPrefix string, archives []string) error {
+func (rs *RapidSyncer) syncMissingArchives(ctx context.Context, src Source, dstPrefix string, archives []string) error {
 	subCtx, cancel := context.WithCancel(ctx)
 	errorCh := make(chan error, 1)
 
@@ -371,7 +345,7 @@ func (rs *RapidSyncer) syncMissingArchives(ctx context.Context, srcRepo string, 
 		go func() {
 			defer uploadWg.Done()
 			for hash := range poolFetchCh {
-				content, err := rs.fetchPoolEntry(subCtx, srcRepo, hash)
+				content, err := rs.fetchPoolEntry(subCtx, src, hash)
 				if err != nil {
 					select {
 					case errorCh <- err:
@@ -400,7 +374,7 @@ func (rs *RapidSyncer) syncMissingArchives(ctx context.Context, srcRepo string, 
 			defer uploadWg.Done()
 			defer poolFetchWg.Done()
 			for a := range archivesCh {
-				entries, archiveBuf, err := rs.fetchArchive(subCtx, srcRepo, a)
+				entries, archiveBuf, err := rs.fetchArchive(subCtx, src, a)
 				<-gotFiles
 				if err != nil {
 					select {
@@ -457,14 +431,14 @@ func (rs *RapidSyncer) syncMissingArchives(ctx context.Context, srcRepo string, 
 	return err
 }
 
-func (rs *RapidSyncer) Sync(ctx context.Context, srcRepo string, dstPrefix string) (int, error) {
-	same, missingArchives, versionsBuf, err := rs.compareVersions(ctx, srcRepo, dstPrefix)
+func (rs *RapidSyncer) Sync(ctx context.Context, src Source, dstPrefix string) (int, error) {
+	same, missingArchives, versionsBuf, err := rs.compareVersions(ctx, src, dstPrefix)
 	if err != nil {
 		return 0, fmt.Errorf("compute missing archives: %v", err)
 	} else if same {
 		return 0, nil
 	}
-	if err = rs.syncMissingArchives(ctx, srcRepo, dstPrefix, missingArchives); err != nil {
+	if err = rs.syncMissingArchives(ctx, src, dstPrefix, missingArchives); err != nil {
 		return 0, fmt.Errorf("syncing failed: %v", err)
 	}
 	if err = rs.uploadFile(ctx, dstPrefix, "versions.gz", versionsBuf); err != nil {

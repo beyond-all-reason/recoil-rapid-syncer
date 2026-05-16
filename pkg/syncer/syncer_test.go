@@ -11,9 +11,9 @@ import (
 	"encoding/binary"
 	"encoding/csv"
 	"encoding/hex"
+	"fmt"
 	"hash/crc32"
-	"net/http"
-	"net/http/httptest"
+	"io"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -101,18 +101,19 @@ func gzipBytes(t *testing.T, data []byte) []byte {
 	return buf.Bytes()
 }
 
-// sourceServer serves a rapid-repo rooted at /repo/ backed by the provided
-// files map. Requests to unknown paths return 404. It counts per-path hits.
-type sourceServer struct {
-	*httptest.Server
-	hits   map[string]*atomic.Int64
-	prefix string
+// fakeSource implements Source from an in-memory file map and counts per-path
+// hits so tests can assert on fetch behavior.
+type pathStats struct {
+	hits        atomic.Int64
+	noCacheHits atomic.Int64
 }
 
-func newSourceServer(t *testing.T, versionsGz []byte, sdps, pool map[string][]byte) *sourceServer {
-	t.Helper()
-	srv := &sourceServer{hits: make(map[string]*atomic.Int64), prefix: "/repo/"}
+type fakeSource struct {
+	files map[string][]byte
+	stats map[string]*pathStats
+}
 
+func newFakeSource(versionsGz []byte, sdps, pool map[string][]byte) *fakeSource {
 	files := map[string][]byte{}
 	if versionsGz != nil {
 		files["versions.gz"] = versionsGz
@@ -123,35 +124,36 @@ func newSourceServer(t *testing.T, versionsGz []byte, sdps, pool map[string][]by
 	for p, b := range pool {
 		files[p] = b
 	}
+	stats := make(map[string]*pathStats, len(files))
 	for k := range files {
-		srv.hits[k] = &atomic.Int64{}
+		stats[k] = &pathStats{}
 	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		p := strings.TrimPrefix(r.URL.Path, srv.prefix)
-		body, ok := files[p]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		if c, ok := srv.hits[p]; ok {
-			c.Add(1)
-		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Write(body)
-	})
-	srv.Server = httptest.NewServer(mux)
-	return srv
+	return &fakeSource{files: files, stats: stats}
 }
 
-func (s *sourceServer) repoURL() string {
-	return s.URL + s.prefix
+func (s *fakeSource) Open(_ context.Context, path string, opts OpenOptions) (io.ReadCloser, error) {
+	b, ok := s.files[path]
+	if !ok {
+		return nil, fmt.Errorf("%s: %w", path, ErrNotFound)
+	}
+	st := s.stats[path]
+	st.hits.Add(1)
+	if opts.NoCache {
+		st.noCacheHits.Add(1)
+	}
+	return io.NopCloser(bytes.NewReader(b)), nil
 }
 
-func (s *sourceServer) hitCount(path string) int64 {
-	if c, ok := s.hits[path]; ok {
-		return c.Load()
+func (s *fakeSource) hitCount(path string) int64 {
+	if st, ok := s.stats[path]; ok {
+		return st.hits.Load()
+	}
+	return 0
+}
+
+func (s *fakeSource) noCacheCount(path string) int64 {
+	if st, ok := s.stats[path]; ok {
+		return st.noCacheHits.Load()
 	}
 	return 0
 }
@@ -167,13 +169,12 @@ func TestSync_EmptyDestination(t *testing.T) {
 		},
 	}}
 	versionsGz, sdpByHash, poolFiles := buildFixture(t, archives)
-	src := newSourceServer(t, versionsGz, sdpByHash, poolFiles)
-	defer src.Close()
+	src := newFakeSource(versionsGz, sdpByHash, poolFiles)
 
 	dst := bunny.NewFakeStorageZone()
 	rs := NewRapidSyncer(dst)
 
-	n, err := rs.Sync(context.Background(), src.repoURL(), "byar")
+	n, err := rs.Sync(context.Background(), src, "byar")
 	if err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
@@ -190,11 +191,17 @@ func TestSync_EmptyDestination(t *testing.T) {
 		if _, ok := got[key]; !ok {
 			t.Errorf("missing %s in dest", key)
 		}
+		if got := src.noCacheCount("packages/" + h + ".sdp"); got != 0 {
+			t.Errorf("archive %s should not request NoCache: %d", h, got)
+		}
 	}
 	for p := range poolFiles {
 		key := "byar/" + p
 		if _, ok := got[key]; !ok {
 			t.Errorf("missing %s in dest", key)
+		}
+		if got := src.noCacheCount(p); got != 0 {
+			t.Errorf("pool %s should not request NoCache: %d", p, got)
 		}
 	}
 }
@@ -205,8 +212,7 @@ func TestSync_AlreadyInSync(t *testing.T) {
 		entries: []fakeEntry{{name: "file.sd7", content: []byte("content")}},
 	}}
 	versionsGz, sdpByHash, poolFiles := buildFixture(t, archives)
-	src := newSourceServer(t, versionsGz, sdpByHash, poolFiles)
-	defer src.Close()
+	src := newFakeSource(versionsGz, sdpByHash, poolFiles)
 
 	dst := bunny.NewFakeStorageZone()
 	seed := map[string][]byte{"byar/versions.gz": versionsGz}
@@ -219,7 +225,7 @@ func TestSync_AlreadyInSync(t *testing.T) {
 	dst.Seed(seed)
 
 	rs := NewRapidSyncer(dst)
-	n, err := rs.Sync(context.Background(), src.repoURL(), "byar")
+	n, err := rs.Sync(context.Background(), src, "byar")
 	if err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
@@ -228,6 +234,9 @@ func TestSync_AlreadyInSync(t *testing.T) {
 	}
 	if got := src.hitCount("versions.gz"); got != 1 {
 		t.Errorf("source versions.gz hits = %d, want 1", got)
+	}
+	if got := src.noCacheCount("versions.gz"); got != 1 {
+		t.Errorf("versions.gz must be fetched with NoCache: noCacheHits = %d, want 1", got)
 	}
 	for h := range sdpByHash {
 		if got := src.hitCount("packages/" + h + ".sdp"); got != 0 {
@@ -263,8 +272,7 @@ func TestSync_PartialDedupByPoolListing(t *testing.T) {
 		},
 	}
 	versionsGz, sdpByHash, poolFiles := buildFixture(t, archives)
-	src := newSourceServer(t, versionsGz, sdpByHash, poolFiles)
-	defer src.Close()
+	src := newFakeSource(versionsGz, sdpByHash, poolFiles)
 
 	// Seed the destination with the shared pool entry already present.
 	dst := bunny.NewFakeStorageZone()
@@ -274,7 +282,7 @@ func TestSync_PartialDedupByPoolListing(t *testing.T) {
 	})
 
 	rs := NewRapidSyncer(dst)
-	n, err := rs.Sync(context.Background(), src.repoURL(), "byar")
+	n, err := rs.Sync(context.Background(), src, "byar")
 	if err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
@@ -302,13 +310,12 @@ func TestSync_MissingDestVersions404(t *testing.T) {
 		entries: []fakeEntry{{name: "f.sd7", content: []byte("x")}},
 	}}
 	versionsGz, sdpByHash, poolFiles := buildFixture(t, archives)
-	src := newSourceServer(t, versionsGz, sdpByHash, poolFiles)
-	defer src.Close()
+	src := newFakeSource(versionsGz, sdpByHash, poolFiles)
 
 	dst := bunny.NewFakeStorageZone() // fully empty, Download yields 404
 	rs := NewRapidSyncer(dst)
 
-	n, err := rs.Sync(context.Background(), src.repoURL(), "byar")
+	n, err := rs.Sync(context.Background(), src, "byar")
 	if err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
@@ -343,12 +350,11 @@ func TestSync_CorruptedSourceArchive(t *testing.T) {
 	b[1+len("f.sd7")] ^= 0xff
 	sdpByHash[archHash] = gzipBytes(t, b)
 
-	src := newSourceServer(t, versionsGz, sdpByHash, poolFiles)
-	defer src.Close()
+	src := newFakeSource(versionsGz, sdpByHash, poolFiles)
 	dst := bunny.NewFakeStorageZone()
 	rs := NewRapidSyncer(dst)
 
-	_, err = rs.Sync(context.Background(), src.repoURL(), "byar")
+	_, err = rs.Sync(context.Background(), src, "byar")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -358,12 +364,11 @@ func TestSync_CorruptedSourceArchive(t *testing.T) {
 }
 
 func TestSync_SourceVersions404(t *testing.T) {
-	src := newSourceServer(t, nil, nil, nil) // nothing served; everything 404s
-	defer src.Close()
+	src := newFakeSource(nil, nil, nil) // nothing served; everything ErrNotFound
 	dst := bunny.NewFakeStorageZone()
 	rs := NewRapidSyncer(dst)
 
-	_, err := rs.Sync(context.Background(), src.repoURL(), "byar")
+	_, err := rs.Sync(context.Background(), src, "byar")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -389,8 +394,7 @@ func TestSync_PoolListingSeesPreseededOrphan(t *testing.T) {
 		},
 	}}
 	versionsGz, sdpByHash, poolFiles := buildFixture(t, archives)
-	src := newSourceServer(t, versionsGz, sdpByHash, poolFiles)
-	defer src.Close()
+	src := newFakeSource(versionsGz, sdpByHash, poolFiles)
 
 	dst := bunny.NewFakeStorageZone()
 	dst.Seed(map[string][]byte{
@@ -398,7 +402,7 @@ func TestSync_PoolListingSeesPreseededOrphan(t *testing.T) {
 	})
 
 	rs := NewRapidSyncer(dst)
-	_, err := rs.Sync(context.Background(), src.repoURL(), "byar")
+	_, err := rs.Sync(context.Background(), src, "byar")
 	if err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}

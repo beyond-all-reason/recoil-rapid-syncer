@@ -20,6 +20,7 @@ import (
 type Server struct {
 	syncer      *syncer.RapidSyncer
 	srcRepoRoot string
+	httpClient  *http.Client
 }
 
 func (s *Server) HandleSync(w http.ResponseWriter, r *http.Request) {
@@ -39,8 +40,8 @@ func (s *Server) HandleSync(w http.ResponseWriter, r *http.Request) {
 	synced := make([]int, len(repos))
 	var out strings.Builder
 	for i, repo := range repos {
-		srcRepo := s.srcRepoRoot + repo + "/"
-		synced[i], err = s.syncer.Sync(r.Context(), srcRepo, repo)
+		src := syncer.NewHTTPSource(s.srcRepoRoot+repo+"/", s.httpClient)
+		synced[i], err = s.syncer.Sync(r.Context(), src, repo)
 		if err != nil {
 			log.Printf("Failed to sync: %v", err)
 			http.Error(w, "Sync Failed", http.StatusInternalServerError)
@@ -82,6 +83,7 @@ func main() {
 	server := &Server{
 		syncer:      syncer.NewRapidSyncer(zoneClient),
 		srcRepoRoot: sourceRapidRepo,
+		httpClient:  syncer.NewHTTPClient(),
 	}
 
 	http.HandleFunc("/sync", server.HandleSync)
